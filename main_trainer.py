@@ -2,11 +2,14 @@ import os
 # Kaggle T4 x2: expose both GPUs so DataParallel can split each batch.
 # (Embedding precomputation with ESM/IgFold still runs on cuda:0.)
 os.environ["CUDA_VISIBLE_DEVICES"] = '0,1'
-from antigen_antibody_emb import * 
+from antigen_antibody_emb import *
 from antibinder_model import *
 import torch
-import torch.nn as nn 
-import numpy as np 
+import torch.nn as nn
+import numpy as np
+# Explicit import: wildcard imports above could otherwise shadow pandas
+# (cfg_ab historically did "from turtle import pd").
+import pandas as pd
 from torch.utils.data import DataLoader 
 from copy import deepcopy 
 from tqdm import tqdm
