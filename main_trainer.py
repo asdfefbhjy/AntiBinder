@@ -53,7 +53,7 @@ class Trainer():
     def train(self, criterion, epochs):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr)
         # Mixed precision: roughly halves activation memory and speeds up T4s.
-        scaler = torch.cuda.amp.GradScaler(device="cuda")
+        scaler = torch.cuda.amp.GradScaler()
         accum = max(1, self.args.grad_accum)
         for epoch in range(epochs):
             self.model.train(True)
@@ -64,7 +64,7 @@ class Trainer():
             Y = []
             optimizer.zero_grad()
             for step, (antibody_set, antigen_set, label) in enumerate(tqdm(self.train_dataloader)):
-                with torch.cuda.amp.autocast(device="cuda"):
+                with torch.cuda.amp.autocast():
                     probs = self.model(antibody_set, antigen_set)
                     y = label.float().cuda()
                     # Compute BCE in fp32: Sigmoid+log is numerically unstable in fp16.
