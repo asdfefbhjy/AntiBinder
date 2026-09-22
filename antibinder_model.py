@@ -4,7 +4,7 @@ import torch.nn as nn
 from antigen_antibody_emb import *
 from cfg_ab import *
 from torch.utils.data import DataLoader
-os.chdir('/AntiBinder')
+# os.chdir('/AntiBinder')
 
 
 class AntiModelIinitial():

@@ -59,8 +59,14 @@ class Trainer():
         Y_hat = []
         Y = []
         Y_scores = []
+        import ipdb
+        ipdb.set_trace(context=20) # context=20，断点前后展示10行代码
+  
         with torch.no_grad():
             for antibody_set, antigen_set, label in tqdm(self.valid_dataloader):
+                import ipdb
+                ipdb.set_trace(context=20) # context=20，断点前后展示10行代码
+
                 probs = self.model(antibody_set, antigen_set)
                 # print(probs)
                 #10*2
@@ -79,6 +85,9 @@ class Trainer():
     
 
     def train(self):
+        import ipdb
+        ipdb.set_trace(context=10) # context=10，断点前后展示10行代码
+ 
         val_auc, val_prescision, val_acc, val_recall, val_f1, TN, FP, FN, TP =self.valid()
         self.logger.log([val_auc, val_prescision, val_acc, val_recall, val_f1, TN, FP, FN, TP])
 
@@ -99,33 +108,39 @@ if __name__ == "__main__":
 
     antigen_config = configuration()
     setattr(antigen_config, 'max_position_embeddings', 1024)
+    print("antigen_config:\n", antigen_config)
 
     antibody_config = configuration()
     setattr(antibody_config, 'max_position_embeddings',149)
- 
-
+    print("antibody_config:\n", antibody_config)
 
     model = antibinder(antibody_hidden_dim=1024,antigen_hidden_dim=1024,latent_dim=args.latent_dim,res=False).cuda()
-    print(model)
+    print("model:\n", model)
    
     
     # load model
-    weight = torch.load('')
-    model.load_state_dict(weight)
-    print("load success")
+    # weight = torch.load('')
+    # model.load_state_dict(weight)
+    # print("load success")
 
 
     # choose test dataset
     if args.data == 'test':
-        data_path = ''
+        # data_path = './datasets/process_data/HIV/dataset_hiv_split.csv'
+        data_path = './datasets/process_data/COVID-19/Cov_with_target_split.csv'
   
 
     print (data_path)
+
+    import ipdb
+    ipdb.set_trace(context=20) # context=20，断点前后展示10行代码
+  
     val_dataset =antibody_antigen_dataset(antigen_config=antigen_config,antibody_config=antibody_config,data_path=data_path, train=False, test=True, rate1=0)
     val_dataloader = DataLoader(val_dataset, shuffle=False, batch_size=args.batch_size)
   
-    logger = CSVLogger_my(['val_auc', 'val_prescision', 'val_acc', 'val_recall', 'val_f1', 'TN', 'FP', 'FN', 'TP'],f"/AntiBinder/logs/{args.model_name}_{args.latent_dim}_{args.data}.csv")
+    logger = CSVLogger_my(['val_auc', 'val_prescision', 'val_acc', 'val_recall', 'val_f1', 'TN', 'FP', 'FN', 'TP'],f"./logs/{args.model_name}_{args.latent_dim}_{args.data}.csv")
     
+
     scheduler = None
     trainer = Trainer(
         model = model,
@@ -133,5 +148,6 @@ if __name__ == "__main__":
         logger = logger,
         args= args,
         )
-    
+      
     trainer.train()
+    print("\n\nSuccess!!!")

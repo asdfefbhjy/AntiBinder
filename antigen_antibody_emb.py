@@ -4,7 +4,7 @@ import lmdb
 import pickle
 import torch
 import torch.nn as nn
-import torch.nn. functional as F
+import torch.nn.functional as F
 import pandas as pd
 import sys
 sys.path.append("/AntiBinder")
@@ -37,6 +37,7 @@ class antibody_antigen_dataset(nn.Module):
             df = df.dropna(subset=['H-FR1','H-CDR1','H-FR2','H-CDR2','H-FR3','H-CDR3','H-FR4'])
    
         self.antigen_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+        self.antigen_model = self.antigen_model.cuda()  
         self.batch_converter = alphabet.get_batch_converter()
 
         if train==True and test==False: # train
@@ -84,25 +85,39 @@ class antibody_antigen_dataset(nn.Module):
     
 
     def __getitem__(self, index):
+        import ipdb
+        ipdb.set_trace(context=20) # context=20，断点前后展示10行代码
+ 
         data = self.data.iloc[index]
         label = torch.tensor(data['ANT_Binding'])
-        if not os.path.exists('/AntiBinder/antigen_esm/train/'+str(self.data.iloc[index]['Antigen'])+'.pt'):
+        if not os.path.exists('./antigen_esm/train/'+str(self.data.iloc[index]['Antigen'])+'.pt'):
+            os.makedirs('./antigen_esm/train/', exist_ok=True)
             antigen = self.func_padding_for_esm(self.data['Antigen Sequence'].iloc[index], self.antigen_config.max_position_embeddings)
             antigen = [('antigen', antigen)]
             batch_labels, batch_strs, antigen = self.batch_converter(antigen)
+            antigen = antigen.cuda()
             with torch.no_grad():
+                # import ipdb
+                # ipdb.set_trace(context=20) # context=20，断点前后展示10行代码
+  
                 self.antigen_model = self.antigen_model.eval()
-                antigen = self.antigen_model(antigen.squeeze(1), repr_layers=[33], return_contacts=True)
-                antigen = antigen['representations'][33].squeeze(0)
-            torch.save(antigen,'/AntiBinder/antigen_esm/train/'+str(self.data.iloc[index]['Antigen'])+'.pt')
+                # antigen = self.antigen_model(antigen.squeeze(1), repr_layers=[33], return_contacts=True)
+                ## Set return_contacts=False to reduce memory usage
+                antigen = self.antigen_model(antigen.squeeze(1), repr_layers=[33], return_contacts=False)
+                antigen = antigen['representations'][33].squeeze(0).cpu()
+            torch.save(antigen,'./antigen_esm/train/'+str(self.data.iloc[index]['Antigen'])+'.pt')
         
-        antigen_structure = torch.load("/AntiBinder/antigen_esm/train/"+str(self.data.iloc[index]['Antigen'])+'.pt')
+        antigen_structure = torch.load("./antigen_esm/train/"+str(self.data.iloc[index]['Antigen'])+'.pt')
         # print("antigen_structure："，antigen_structure)
         # print("antigen_structure shape: ", antigen_structure.shape)
         
+        import ipdb
+        ipdb.set_trace(context=20) # context=20，断点前后展示10行代码
+ 
         emb_seq = data['H-FR1'] + data['H-CDR1'] + data['H-FR2'] + data['H-CDR2'] + data['H-FR3'] + data['H-CDR3']+data['H-FR4']
         #if not emb_seq in self.structure_embedding.keys():
-        self.env = lmdb.open('/AntiBinder/datasets/fold_emb/fold_emb_for_train',map_size=1024*1024*1024*50,lock=False)
+        os.makedirs('./datasets/fold_emb/', exist_ok=True)
+        self.env = lmdb.open('./datasets/fold_emb/fold_emb_for_train',map_size=1024*1024*1024*50,lock=False)
         self.structure_embedding = self.env.begin(write=True)
         if self.structure_embedding.get(emb_seq.encode()) == None:
             sequences = {
@@ -151,7 +166,7 @@ class antibody_antigen_dataset(nn.Module):
         # print("antibody："，antibody)
         antibody = torch.tensor([AminoAcid_Vocab[aa] for aa in antibody])
         # print("antibody："，antibody)
-        antibody = self.universal_padding(seq=antibody, maxlen=self.antibody_config.max_position_embeddings)
+        antibody = self.universal_padding(antibody, self.antibody_config.max_position_embeddings)
         # print("antibody: ", antibody)
         # print("antibody_shape:", antibody. shape)
 
@@ -162,7 +177,7 @@ class antibody_antigen_dataset(nn.Module):
 
         antigen = data['Antigen Sequence']
         antigen = torch.tensor([AminoAcid_Vocab[aa] for aa in antigen])
-        antigen = self.universal_padding(seq=antigen, maxlen=self.antigen_config.max_position_embeddings)
+        antigen = self.universal_padding(antigen, self.antigen_config.max_position_embeddings)
 
         antigen_structure = antigen_structure[:1024, :]
         # print(antigen_structure.shape)
@@ -180,7 +195,7 @@ if __name__ == "__main__":
 
     os.environ["CUDA_VISIBLE_DEVICES"] = '0,1'
 
-    data_path = '/AntiBinder/datasets/xx'
+    data_path = './datasets/xx'
     dataset = antibody_antigen_dataset(antigen_config=antigen_config,antibody_config=antibody_config, data_path=data_path, train=True, test=False, rate1=0.0001)
     # pdb. set_trace()
     x1 = dataset[0]

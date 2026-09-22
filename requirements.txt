@@ -1,0 +1,14 @@
+beautifulsoup4 
+biopython 
+biotite 
+bs4 
+fair-esm
+idna 
+igfold 
+lmdb 
+logomaker 
+ml-collections 
+scikit-learn 
+seaborn 
+six 
+tqdm 
