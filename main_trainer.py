@@ -79,6 +79,11 @@ class Trainer():
                 # the mixed-precision gradient scaling.
                 scaler.scale(loss).backward()
 
+                # Flatten per batch: the final batch can be shorter (17 vs 32),
+                # so rows can't be stacked into a rectangular array.
+                Y_hat.append(yhat.reshape(-1))
+                Y.append(y.reshape(-1))
+
                 if (step + 1) % accum == 0 or (step + 1) == len(self.train_dataloader):
                     scaler.step(optimizer)
                     scaler.update()
@@ -86,11 +91,11 @@ class Trainer():
 
                 train_loss += loss.item() * accum
                 num_train += antibody_set[0].shape[0]
-                Y_hat.extend(yhat)
-                Y.extend(y)
 
-            train_acc, train_precision, train_f1, recall = self.matrix_val((torch.cat([temp.view(1, -1) for temp in Y_hat], dim=0)).long().cpu().numpy(),
-                                                                            np.array(Y))
+            # Move collected GPU tensors to CPU before sklearn metrics.
+            train_acc, train_precision, train_f1, recall = self.matrix_val(
+                torch.cat(Y_hat).long().cpu().numpy(),
+                torch.cat(Y).cpu().numpy())
             train_loss = train_loss / num_train
             train_loss = np.exp(train_loss)
 
@@ -111,10 +116,10 @@ class Trainer():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=42)
-    # Global batch size (split across GPUs by DataParallel). 32 = 16 per T4.
-    parser.add_argument('--batch_size', type=int, default=32)
-    # Effective batch = batch_size * grad_accum (32 * 4 = 128 by default).
-    parser.add_argument('--grad_accum', type=int, default=4)
+    # Global batch size (split across GPUs by DataParallel). 64 = 32 per T4.
+    parser.add_argument('--batch_size', type=int, default=64)
+    # Effective batch = batch_size * grad_accum (64 * 2 = 128 by default).
+    parser.add_argument('--grad_accum', type=int, default=2)
     # Skip the ESM/IgFold embedding precomputation pass (only safe when every
     # embedding is already cached on disk / in LMDB).
     parser.add_argument('--skip_precompute', action='store_true')
