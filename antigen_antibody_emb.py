@@ -85,9 +85,6 @@ class antibody_antigen_dataset(nn.Module):
     
 
     def __getitem__(self, index):
-        import ipdb
-        ipdb.set_trace(context=20) # context=20，断点前后展示10行代码
- 
         data = self.data.iloc[index]
         label = torch.tensor(data['ANT_Binding'])
         if not os.path.exists('./antigen_esm/train/'+str(self.data.iloc[index]['Antigen'])+'.pt'):
@@ -110,10 +107,7 @@ class antibody_antigen_dataset(nn.Module):
         antigen_structure = torch.load("./antigen_esm/train/"+str(self.data.iloc[index]['Antigen'])+'.pt')
         # print("antigen_structure："，antigen_structure)
         # print("antigen_structure shape: ", antigen_structure.shape)
-        
-        import ipdb
-        ipdb.set_trace(context=20) # context=20，断点前后展示10行代码
- 
+
         emb_seq = data['H-FR1'] + data['H-CDR1'] + data['H-FR2'] + data['H-CDR2'] + data['H-FR3'] + data['H-CDR3']+data['H-FR4']
         #if not emb_seq in self.structure_embedding.keys():
         os.makedirs('./datasets/fold_emb/', exist_ok=True)

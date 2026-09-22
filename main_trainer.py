@@ -1,5 +1,6 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '1'
+# Use the first visible GPU (Kaggle only exposes GPU 0)
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 from antigen_antibody_emb import * 
 from antibinder_model import *
 import torch
@@ -104,6 +105,10 @@ if __name__ == "__main__":
     parser.add_argument('--cuda', type=bool, default=True)
     parser.add_argument('--device', type=str, default='1')
     parser.add_argument('--data', type=str, default='train')
+    # Path to the split CSV (must contain H-FR1..H-FR4, vh, Antigen Sequence,
+    # ANT_Binding and an "Antigen" id column). Override with --data_path.
+    parser.add_argument('--data_path', type=str,
+                        default='./datasets/process_data/COVID-19/Cov_with_target_split.csv')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -125,13 +130,12 @@ if __name__ == "__main__":
     # model.cls = torch.nn.DataParallel(model.cls).cuda()
 
     # here choose dataset
-    if args.data == 'train':
-        data_path = './datasets/**'
-    # elif args.data == 'train_2':
-    #     data_path = ''
-
-
-    # print (data_path)
+    data_path = args.data_path
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(
+            f"Data CSV not found: {data_path}. "
+            f"Pass a valid file with --data_path (cwd={os.getcwd()})"
+        )
     train_dataset = antibody_antigen_dataset(antigen_config=antigen_config,antibody_config=antibody_config,data_path=data_path, train=True, test=False, rate1=1)
     # vaL_dataset =antibody_antigen_dataset(antigen_config=antigen_config,antibody_config=antibody_config,data_path=data path, train=False, test=True, rate1=0.7)
 
@@ -139,6 +143,8 @@ if __name__ == "__main__":
     # vaL_dataloader = DataLoader(val_dataset, shuffLe=False, batch_size=args.batch_size)
   
 
+    os.makedirs('./logs', exist_ok=True)
+    os.makedirs('./ckpts', exist_ok=True)
     logger = CSVLogger_my(['epoch', 'train_loss', 'train_acc', 'train_precision', 'train_f1', 'train_recall'],f"./logs/{args.model_name}_{args.data}_{args.batch_size}_{args.epochs}_{args.latent_dim}_{args.lr}.csv")
     scheduler = None
 
