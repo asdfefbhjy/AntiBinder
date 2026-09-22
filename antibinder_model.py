@@ -42,22 +42,26 @@ class BidirectionalCrossAttention(nn.Module):
         # Antibody to Antigen Attention
         antibody_as_query = antibody_embed.permute(1, 0, 2)
         antigen_as_kv = antigen_embed.permute(1, 0, 2)
-        attn_output_antibody, attn_weights_antibody = self.antibody_to_antigen_attention(
-            query=antibody_as_query, 
+        # need_weights=False lets PyTorch use the memory-efficient attention path
+        # (full attention matrices are never materialized), saving a lot of VRAM.
+        attn_output_antibody, _ = self.antibody_to_antigen_attention(
+            query=antibody_as_query,
             key=antigen_as_kv,
             value=antigen_as_kv,
-            key_padding_mask=antigen_mask
+            key_padding_mask=antigen_mask,
+            need_weights=False
         )
         attn_output_antibody = attn_output_antibody.permute(1, 0, 2)
 
         # Antigen to Antibody Attention
         antigen_as_query = antigen_embed.permute(1, 0, 2)
         antibody_as_kv = antibody_embed.permute(1, 0, 2)
-        attn_output_antigen, attn_weights_antigen = self.antigen_to_antibody_attention(
+        attn_output_antigen, _ = self.antigen_to_antibody_attention(
             query=antigen_as_query,
             key=antibody_as_kv,
-            value=antibody_as_kv, 
-            key_padding_mask=antibody_mask
+            value=antibody_as_kv,
+            key_padding_mask=antibody_mask,
+            need_weights=False
         )
         attn_output_antigen = attn_output_antigen.permute(1, 0, 2)
 
@@ -137,11 +141,14 @@ class Combine_Embedding(nn.Module):
         self.antigen_sturcture_change_dim = nn.Sequential(nn.Linear(1280,antigen_hidden_dim),nn.ReLU())
 
         
-    def forward(self, antibody, antigen):  
+    def forward(self, antibody, antigen):
         # antibody: [antibody,at_type,antibody_structure]
         # antigen : [antigen,antigen_structure]
-        antibody[0], antibody[1], antibody[2] = antibody[0].cuda(), antibody[1].cuda(), antibody[2].cuda()
-        antigen[0],antigen[1] = antigen[0].cuda(),antigen[1].cuda()
+        # Follow the input device instead of hardcoding cuda:0
+        # (required for DataParallel / multi-GPU training).
+        device = antibody[0].device
+        antibody[0], antibody[1], antibody[2] = antibody[0].to(device), antibody[1].to(device), antibody[2].to(device)
+        antigen[0], antigen[1] = antigen[0].to(device), antigen[1].to(device)
 
         antibody_seq_emb = self.seq_emb(seq = antibody[0], type = antibody[1])
         # print(antibody[2].shape)

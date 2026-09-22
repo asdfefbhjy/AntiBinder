@@ -12,6 +12,7 @@ from cfg_ab import AminoAcid_Vocab
 from cfg_ab import configuration
 import pdb
 from math import ceil
+from tqdm import tqdm
 from igfold import IgFoldRunner
 
 
@@ -179,6 +180,30 @@ class antibody_antigen_dataset(nn.Module):
 
     def __len__(self):
         return self.data.shape[0]
+
+
+    @torch.no_grad()
+    def precompute_embeddings(self):
+        """Run every sample through ESM-2 / IgFold once so that all embeddings
+        are cached on disk (.pt) / LMDB before training. Afterwards the heavy
+        encoder models can be removed from the GPU (see release_encoders)."""
+        print(f"Precomputing embeddings for {len(self)} samples...")
+        for i in tqdm(range(len(self))):
+            _ = self[i]
+        print("Embedding precomputation finished.")
+
+
+    def release_encoders(self):
+        """Free ESM-2 and IgFold GPU memory. Only safe after all embeddings
+        have been precomputed, since __getitem__ then only reads caches."""
+        import gc
+        for attr in ("antigen_model", "batch_converter", "igfold"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                delattr(self, attr)
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("ESM-2 / IgFold encoders released from GPU memory.")
 
 
 if __name__ == "__main__":
