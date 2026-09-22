@@ -2,6 +2,8 @@ import esm
 import os
 import lmdb
 import pickle
+import contextlib
+import io
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -126,9 +128,12 @@ class antibody_antigen_dataset(nn.Module):
             sequences = {
                 "H": emb_seq
                 }
-            emb = self.igfold.embed(
-                sequences=sequences,
-                )
+            # IgFold prints "Completed embedding in ..." on every call;
+            # silence it so only the tqdm precompute bar is shown.
+            with contextlib.redirect_stdout(io.StringIO()):
+                emb = self.igfold.embed(
+                    sequences=sequences,
+                    )
             structure = emb.structure_embs.detach().cpu()
             #self.structure_embedding[emb_seq] = structure
             self.structure_embedding.put(key=emb_seq.encode(), value=pickle.dumps(structure)) 
