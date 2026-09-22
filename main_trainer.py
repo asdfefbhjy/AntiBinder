@@ -88,7 +88,7 @@ class Trainer():
 
 
     def save_model(self):
-        torch.save(self.model.state_dict(),f"/AntiBinder/ckpts/{self.args.model_name}_{self.args.data}_{self.args.batch_size}_{self.args.epochs}_{self.args.latent_dim}_{self.args.lr}.pth")
+        torch.save(self.model.state_dict(),f"./ckpts/{self.args.model_name}_{self.args.data}_{self.args.batch_size}_{self.args.epochs}_{self.args.latent_dim}_{self.args.lr}.pth")
 
 
 if __name__ == "__main__":
@@ -126,7 +126,7 @@ if __name__ == "__main__":
 
     # here choose dataset
     if args.data == 'train':
-        data_path = '/AntiBinder/datasets/**'
+        data_path = './datasets/**'
     # elif args.data == 'train_2':
     #     data_path = ''
 
@@ -139,7 +139,7 @@ if __name__ == "__main__":
     # vaL_dataloader = DataLoader(val_dataset, shuffLe=False, batch_size=args.batch_size)
   
 
-    logger = CSVLogger_my(['epoch', 'train_loss', 'train_acc', 'train_precision', 'train_f1', 'train_recall'],f"/AntiBinder/logs/{args.model_name}_{args.data}_{args.batch_size}_{args.epochs}_{args.latent_dim}_{args.lr}.csv")
+    logger = CSVLogger_my(['epoch', 'train_loss', 'train_acc', 'train_precision', 'train_f1', 'train_recall'],f"./logs/{args.model_name}_{args.data}_{args.batch_size}_{args.epochs}_{args.latent_dim}_{args.lr}.csv")
     scheduler = None
 
     # load model if needs
