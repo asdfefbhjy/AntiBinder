@@ -66,11 +66,17 @@ class Trainer():
             for step, (antibody_set, antigen_set, label) in enumerate(tqdm(self.train_dataloader)):
                 with torch.cuda.amp.autocast():
                     probs = self.model(antibody_set, antigen_set)
-                    y = label.float().cuda()
-                    # Compute BCE in fp32: Sigmoid+log is numerically unstable in fp16.
-                    loss = criterion(probs.float().view(-1), y.view(-1)) / accum
+
+                # BCELoss is hard-blocked inside autocast and numerically
+                # unstable in fp16, so cast sigmoid outputs to fp32 and
+                # compute the loss OUTSIDE the autocast region.
+                probs = probs.float()
+                y = label.float().cuda()
+                loss = criterion(probs.view(-1), y.view(-1)) / accum
 
                 yhat = (probs > 0.5).long()
+                # Backprop still reaches the fp16 graph; GradScaler handles
+                # the mixed-precision gradient scaling.
                 scaler.scale(loss).backward()
 
                 if (step + 1) % accum == 0 or (step + 1) == len(self.train_dataloader):
