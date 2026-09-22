@@ -20,15 +20,16 @@ warnings.filterwarnings("ignore")
 
 
 class Trainer():
-    def __init__(self, model, train_dataloader, args, logger, load=False) -> None:
+    def __init__(self, model, train_dataloader, args, logger, valid_dataloader=None, load=False) -> None:
         self.model = model
         self.train_dataloader = train_dataloader
-        # self.vaLid_dataloader = valid_dataloader
-        # self.test_dataloader = test_dataloader
+        self.valid_dataloader = valid_dataloader
         self.args = args
         self.logger = logger
-        # self.grad_clip = args.grad_clip # cLip gradients at this value, or disable if == 0.0
         self.best_loss = None
+        # Checkpoints are selected on validation F1 when a val split exists.
+        self.best_val_f1 = None
+        self.epochs_no_improve = 0
         self.load = load
 
         if self.load==False:
@@ -49,7 +50,33 @@ class Trainer():
     def matrix_val(self,yhat,y) :
         # print(sum(yhat))
         return accuracy_score(y,yhat), precision_score(y, yhat), f1_score(y,yhat), recall_score(y, yhat)
-    
+
+    @torch.no_grad()
+    def validate(self, criterion):
+        """Evaluate on the held-out validation split. No grads / optimizer."""
+        self.model.eval()
+        val_loss = 0.0
+        num_val = 0
+        Y_hat, Y = [], []
+        for antibody_set, antigen_set, label in tqdm(self.valid_dataloader, desc='Validating'):
+            with torch.cuda.amp.autocast():
+                probs = self.model(antibody_set, antigen_set)
+            probs = probs.float()
+            y = label.float().cuda()
+            # Sum of per-sample BCE (reduction='mean' averaged over the batch;
+            # multiply by batch size, then divide by the total at the end so
+            # the partial last batch is weighted correctly).
+            val_loss += criterion(probs.view(-1), y.view(-1)).item() * y.shape[0]
+            num_val += y.shape[0]
+            Y_hat.append((probs > 0.5).long().reshape(-1))
+            Y.append(y.reshape(-1))
+
+        val_acc, val_precision, val_f1, val_recall = self.matrix_val(
+            torch.cat(Y_hat).long().cpu().numpy(),
+            torch.cat(Y).cpu().numpy())
+        val_loss = np.exp(val_loss / num_val)
+        return val_loss, val_acc, val_precision, val_f1, val_recall
+
     def train(self, criterion, epochs):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr)
         # Mixed precision: roughly halves activation memory and speeds up T4s.
@@ -93,18 +120,42 @@ class Trainer():
                 num_train += antibody_set[0].shape[0]
 
             # Move collected GPU tensors to CPU before sklearn metrics.
-            train_acc, train_precision, train_f1, recall = self.matrix_val(
+            train_acc, train_precision, train_f1, train_recall = self.matrix_val(
                 torch.cat(Y_hat).long().cpu().numpy(),
                 torch.cat(Y).cpu().numpy())
             train_loss = train_loss / num_train
             train_loss = np.exp(train_loss)
 
-            self.logger.log([epoch+1, train_loss, train_acc, train_precision,train_f1,recall])
-            print(f"Epoch {epoch+1}, Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, Precision: {train_precision:.4f}, F1: {train_f1:.4f}, Recall: {recall:.4f}")
-            if self.best_loss is None or train_loss < self.best_loss:
-                print('epoch: ', epoch, ' saving...')
-                self.best_loss = train_loss
-                self.save_model()
+            print(f"Epoch {epoch+1} | train_loss: {train_loss:.4f}, train_acc: {train_acc:.4f}, "
+                  f"train_precision: {train_precision:.4f}, train_f1: {train_f1:.4f}, train_recall: {train_recall:.4f}")
+
+            if self.valid_dataloader is not None:
+                val_loss, val_acc, val_precision, val_f1, val_recall = self.validate(criterion)
+                print(f"Epoch {epoch+1} | val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}, "
+                      f"val_precision: {val_precision:.4f}, val_f1: {val_f1:.4f}, val_recall: {val_recall:.4f}")
+                self.logger.log([epoch+1, train_loss, train_acc, train_precision, train_f1, train_recall,
+                                 val_loss, val_acc, val_precision, val_f1, val_recall])
+
+                # Select checkpoints on held-out validation F1.
+                if self.best_val_f1 is None or val_f1 > self.best_val_f1:
+                    print(f"val_f1 improved ({self.best_val_f1} -> {val_f1:.4f}), saving...")
+                    self.best_val_f1 = val_f1
+                    self.epochs_no_improve = 0
+                    self.save_model()
+                else:
+                    self.epochs_no_improve += 1
+                    print(f"val_f1 did not improve for {self.epochs_no_improve} epoch(s) "
+                          f"(best: {self.best_val_f1:.4f}).")
+                    if self.args.patience > 0 and self.epochs_no_improve >= self.args.patience:
+                        print(f"Early stopping at epoch {epoch+1}. Best val_f1: {self.best_val_f1:.4f}")
+                        break
+            else:
+                # No val split: fall back to training-loss selection.
+                self.logger.log([epoch+1, train_loss, train_acc, train_precision, train_f1, train_recall])
+                if self.best_loss is None or train_loss < self.best_loss:
+                    print('epoch: ', epoch, ' saving...')
+                    self.best_loss = train_loss
+                    self.save_model()
 
     def save_model(self):
         # DataParallel wraps the model in .module; save unwrapped weights
@@ -120,10 +171,13 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=64)
     # Effective batch = batch_size * grad_accum (64 * 2 = 128 by default).
     parser.add_argument('--grad_accum', type=int, default=2)
-    # Skip the ESM/IgFold embedding precomputation pass (only safe when every
-    # embedding is already cached on disk / in LMDB).
-    parser.add_argument('--skip_precompute', action='store_true')
     parser.add_argument('--latent_dim', type=int, default=36)
+    # Fraction of rows used for TRAINING; the rest is the held-out validation
+    # set. Set to 1.0 to disable validation (checkpoint falls back to train loss).
+    parser.add_argument('--train_rate', type=float, default=0.8)
+    # Stop after this many consecutive epochs without val-F1 improvement.
+    # 0 disables early stopping.
+    parser.add_argument('--patience', type=int, default=30)
     # In certain datasets, an early stopping strategy is required to achieve optimal results.
     parser.add_argument('--epochs', type=int, default=500)
     # parser.add_argument('--weight_decay', type=float, default=1e-5, help='weight decay used in optimizer') # 1e-5
@@ -155,20 +209,36 @@ if __name__ == "__main__":
             f"Pass a valid file with --data_path (cwd={os.getcwd()})"
         )
 
+    # Shuffle rows BEFORE the positional 80/20 split so both splits cover all
+    # antigens/classes (the CSV rows are not randomly ordered). Both datasets
+    # receive the same shuffled frame, so their slices are complementary.
+    df = pd.read_csv(data_path)
+    df = df.dropna(subset=['H-FR1','H-CDR1','H-FR2','H-CDR2','H-FR3','H-CDR3','H-FR4'])
+    df = df.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+
     # NOTE: the dataset constructor loads ESM-2 650M and 4 IgFold models onto
-    # the GPU. Build the dataset FIRST, precompute all embeddings, and release
+    # the GPU. Build the datasets FIRST, precompute all embeddings, and release
     # those encoders before allocating the training model.
-    train_dataset = antibody_antigen_dataset(antigen_config=antigen_config,antibody_config=antibody_config,data_path=data_path, train=True, test=False, rate1=1)
-    # vaL_dataset =antibody_antigen_dataset(antigen_config=antigen_config,antibody_config=antibody_config,data_path=data path, train=False, test=True, rate1=0.7)
+    train_dataset = antibody_antigen_dataset(antigen_config=antigen_config, antibody_config=antibody_config,
+                                              data=df, train=True, test=False, rate1=args.train_rate)
+    val_dataset = None
+    if args.train_rate < 1.0:
+        val_dataset = antibody_antigen_dataset(antigen_config=antigen_config, antibody_config=antibody_config,
+                                                data=df, train=False, test=True, rate1=args.train_rate,
+                                                share_encoders=train_dataset)
 
-    ## TODO: This part remains to be checked
-    # if not args.skip_precompute:
-    #     print("precompute embeddings for train...")
-    #     train_dataset.precompute_embeddings()
-    # train_dataset.release_encoders()
+    print("Precomputing embeddings for train split...")
+    train_dataset.precompute_embeddings()
+    train_dataset.release_encoders()
+    if val_dataset is not None:
+        print("Precomputing embeddings for validation split...")
+        val_dataset.precompute_embeddings()
+        val_dataset.release_encoders()
 
-    train_dataloader = DataLoader(train_dataset, shuffle=False, batch_size=args.batch_size)
-    # vaL_dataloader = DataLoader(val_dataset, shuffLe=False, batch_size=args.batch_size)
+    train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=args.batch_size)
+    val_dataloader = None
+    if val_dataset is not None:
+        val_dataloader = DataLoader(val_dataset, shuffle=False, batch_size=args.batch_size)
 
 
     model = antibinder(antibody_hidden_dim=1024,antigen_hidden_dim=1024,latent_dim=args.latent_dim,res=False).cuda()
@@ -184,7 +254,10 @@ if __name__ == "__main__":
 
     os.makedirs('./logs', exist_ok=True)
     os.makedirs('./ckpts', exist_ok=True)
-    logger = CSVLogger_my(['epoch', 'train_loss', 'train_acc', 'train_precision', 'train_f1', 'train_recall'], f"./logs/{args.model_name}_{args.data}_{args.batch_size}_{args.epochs}_{args.latent_dim}_{args.lr}.csv")
+    log_columns = ['epoch', 'train_loss', 'train_acc', 'train_precision', 'train_f1', 'train_recall']
+    if val_dataloader is not None:
+        log_columns += ['val_loss', 'val_acc', 'val_precision', 'val_f1', 'val_recall']
+    logger = CSVLogger_my(log_columns, f"./logs/{args.model_name}_{args.data}_{args.batch_size}_{args.epochs}_{args.latent_dim}_{args.lr}.csv")
     scheduler = None
 
     # load model if needs
@@ -199,10 +272,9 @@ if __name__ == "__main__":
     trainer = Trainer(
         model=model,
         train_dataloader=train_dataloader,
-        # valid_dataloader=val_dataLoader,
-        # test_dataLoader=test._dataloader,
-        logger = logger,
-        args= args,
+        valid_dataloader=val_dataloader,
+        logger=logger,
+        args=args,
         load=load
     )
 

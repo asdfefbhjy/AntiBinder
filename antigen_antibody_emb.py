@@ -18,13 +18,14 @@ from igfold import IgFoldRunner
 
 class antibody_antigen_dataset(nn.Module):
     def __init__(self,
-                antigen_config: configuration, 
-                antibody_config: configuration, 
+                antigen_config: configuration,
+                antibody_config: configuration,
                 data_path=None,
                 train = True,
-                test = False, 
+                test = False,
                 rate1 = 0.8,
-                data = None) -> None:
+                data = None,
+                share_encoders = None) -> None:
         super().__init__()
         self.antigen_config = antigen_config
         self.antibody_config = antibody_config
@@ -36,10 +37,17 @@ class antibody_antigen_dataset(nn.Module):
             df = pd.read_csv(data_path)## samples of data, attention to your file type
             # df = df.dropna()
             df = df.dropna(subset=['H-FR1','H-CDR1','H-FR2','H-CDR2','H-FR3','H-CDR3','H-FR4'])
-   
-        self.antigen_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-        self.antigen_model = self.antigen_model.cuda()  
-        self.batch_converter = alphabet.get_batch_converter()
+
+        # When building the val split, pass share_encoders=<train_dataset> to
+        # reuse the same ESM-2 / IgFold instances instead of loading a second
+        # ~4 GB copy of the pretrained models.
+        if share_encoders is not None:
+            self.antigen_model = share_encoders.antigen_model
+            self.batch_converter = share_encoders.batch_converter
+        else:
+            self.antigen_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+            self.antigen_model = self.antigen_model.cuda()
+            self.batch_converter = alphabet.get_batch_converter()
 
         if train==True and test==False: # train
             print("This part of dataset is for train.")
@@ -53,7 +61,7 @@ class antibody_antigen_dataset(nn.Module):
 
         self.env = None
         self.structure_embedding = None
-        self.igfold = IgFoldRunner()
+        self.igfold = share_encoders.igfold if share_encoders is not None else IgFoldRunner()
 
 
     def universal_padding(self, sequence, max_length):
