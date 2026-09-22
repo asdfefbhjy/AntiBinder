@@ -14,13 +14,13 @@ import sys
 import argparse
 from utils.utils import CSVLogger_my
 from sklearn.metrics import accuracy_score, precision_score, f1_score, classification_report, recall_score
-sys.path.append ('../') 
+sys.path.append('../') 
 import warnings 
 warnings.filterwarnings("ignore")
 
 
 class Trainer():
-    def __init__(self,model,train_dataloader,args,logger,load=False) -> None:
+    def __init__(self, model, train_dataloader, args, logger, load=False) -> None:
         self.model = model
         self.train_dataloader = train_dataloader
         # self.vaLid_dataloader = valid_dataloader
@@ -50,13 +50,12 @@ class Trainer():
         # print(sum(yhat))
         return accuracy_score(y,yhat), precision_score(y, yhat), f1_score(y,yhat), recall_score(y, yhat)
     
-
     def train(self, criterion, epochs):
-        optimizer = torch.optim.Adam(self.model.parameters(),lr=self.args.lr)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr)
         # Mixed precision: roughly halves activation memory and speeds up T4s.
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.cuda.amp.GradScaler(device="cuda")
         accum = max(1, self.args.grad_accum)
-        for epoch in range(epochs) :
+        for epoch in range(epochs):
             self.model.train(True)
             train_acc = 0
             train_loss = 0
@@ -65,7 +64,7 @@ class Trainer():
             Y = []
             optimizer.zero_grad()
             for step, (antibody_set, antigen_set, label) in enumerate(tqdm(self.train_dataloader)):
-                with torch.cuda.amp.autocast():
+                with torch.cuda.amp.autocast(device="cuda"):
                     probs = self.model(antibody_set, antigen_set)
                     y = label.float().cuda()
                     # Compute BCE in fp32: Sigmoid+log is numerically unstable in fp16.
@@ -85,23 +84,22 @@ class Trainer():
                 Y.extend(y)
 
             train_acc, train_precision, train_f1, recall = self.matrix_val((torch.cat([temp.view(1, -1) for temp in Y_hat], dim=0)).long().cpu().numpy(),
-                                                                            torch.tensor(Y))
+                                                                            np.array(Y))
             train_loss = train_loss / num_train
             train_loss = np.exp(train_loss)
 
             self.logger.log([epoch+1, train_loss, train_acc, train_precision,train_f1,recall])
-
-            if self.best_loss==None or train_loss < self.best_loss:
-                print('epoch: ',epoch, 'saving...')
+            print(f"Epoch {epoch+1}, Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, Precision: {train_precision:.4f}, F1: {train_f1:.4f}, Recall: {recall:.4f}")
+            if self.best_loss is None or train_loss < self.best_loss:
+                print('epoch: ', epoch, ' saving...')
                 self.best_loss = train_loss
                 self.save_model()
-
 
     def save_model(self):
         # DataParallel wraps the model in .module; save unwrapped weights
         # so checkpoints load directly into antibinder(...) later.
         raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-        torch.save(raw_model.state_dict(),f"./ckpts/{self.args.model_name}_{self.args.data}_{self.args.batch_size}_{self.args.epochs}_{self.args.latent_dim}_{self.args.lr}.pth")
+        torch.save(raw_model.state_dict(), f"./ckpts/{self.args.model_name}_{self.args.data}_{self.args.batch_size}_{self.args.epochs}_{self.args.latent_dim}_{self.args.lr}.pth")
 
 
 if __name__ == "__main__":
@@ -119,7 +117,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=500)
     # parser.add_argument('--weight_decay', type=float, default=1e-5, help='weight decay used in optimizer') # 1e-5
     parser.add_argument('--lr', type=float, default=6e-5, help='learning rate')
-    parser.add_argument('--model_name', type=str, default= 'AntiBinder')
+    parser.add_argument('--model_name', type=str, default='AntiBinder')
     parser.add_argument('--cuda', type=bool, default=True)
     parser.add_argument('--data', type=str, default='train')
     # Path to the split CSV (must contain H-FR1..H-FR4, vh, Antigen Sequence,
@@ -152,9 +150,11 @@ if __name__ == "__main__":
     train_dataset = antibody_antigen_dataset(antigen_config=antigen_config,antibody_config=antibody_config,data_path=data_path, train=True, test=False, rate1=1)
     # vaL_dataset =antibody_antigen_dataset(antigen_config=antigen_config,antibody_config=antibody_config,data_path=data path, train=False, test=True, rate1=0.7)
 
-    if not args.skip_precompute:
-        train_dataset.precompute_embeddings()
-    train_dataset.release_encoders()
+    ## TODO: This part remains to be checked
+    # if not args.skip_precompute:
+    #     print("precompute embeddings for train...")
+    #     train_dataset.precompute_embeddings()
+    # train_dataset.release_encoders()
 
     train_dataloader = DataLoader(train_dataset, shuffle=False, batch_size=args.batch_size)
     # vaL_dataloader = DataLoader(val_dataset, shuffLe=False, batch_size=args.batch_size)
@@ -173,7 +173,7 @@ if __name__ == "__main__":
 
     os.makedirs('./logs', exist_ok=True)
     os.makedirs('./ckpts', exist_ok=True)
-    logger = CSVLogger_my(['epoch', 'train_loss', 'train_acc', 'train_precision', 'train_f1', 'train_recall'],f"./logs/{args.model_name}_{args.data}_{args.batch_size}_{args.epochs}_{args.latent_dim}_{args.lr}.csv")
+    logger = CSVLogger_my(['epoch', 'train_loss', 'train_acc', 'train_precision', 'train_f1', 'train_recall'], f"./logs/{args.model_name}_{args.data}_{args.batch_size}_{args.epochs}_{args.latent_dim}_{args.lr}.csv")
     scheduler = None
 
     # load model if needs
@@ -185,14 +185,15 @@ if __name__ == "__main__":
         print("load model success")
 
 
-    trainer = Trainer(model=model,
+    trainer = Trainer(
+        model=model,
         train_dataloader=train_dataloader,
         # valid_dataloader=val_dataLoader,
         # test_dataLoader=test._dataloader,
         logger = logger,
         args= args,
         load=load
-        )
+    )
 
     criterion = nn.BCELoss()
     trainer.train(criterion=criterion, epochs=args.epochs)

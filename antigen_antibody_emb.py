@@ -31,7 +31,7 @@ class antibody_antigen_dataset(nn.Module):
         print (data_path)
         if isinstance(data,pd.DataFrame):
             df = data
-            df.dropna()
+            df = df.dropna()
         else:
             df = pd.read_csv(data_path)## samples of data, attention to your file type
             # df = df.dropna()
