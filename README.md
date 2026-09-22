@@ -35,18 +35,18 @@ pip install -r requirements.txt
 
 ### Usage Instructions
 #### Training
-Prepare labeled sequence data for antigens and antibody heavy chains. Name the columns according to the names specified in the `antigen_antibody_emb.py`. If the heavy chain sequences of the antibodies have not been split, first use `heavy_chain_split.py` to split the sequences. Then, use the command: `python main_trainer.py` to start the model training.
+Prepare labeled sequence data for antigens and antibody heavy chains. Name the columns according to the names specified in the `antigen_antibody_emb.py`. If the heavy chain sequences of the antibodies have not been split, first use `heavy_chain_split.py` to split the sequences. Then, use the command: `python main.py train` to start the model training.
 
 ```python
 # Example code for starting training
 # Start training
-!python main_trainer.py
+!python main.py train
 ```
 #### Testing
-Prepare labeled sequence data for antigens and antibodies. Name the columns according to the names specified in the `antigen_antibody_emb.py`. Then, use the command: `python main_test.py` to start the test.
+Prepare labeled sequence data for antigens and antibodies. Name the columns according to the names specified in the `antigen_antibody_emb.py`. Then, use the command: `python main.py test` to start the test.
 ```python
 # Example code for starting testing
 
-# Start training
-!python main_test.py
+# Start testing
+!python main.py test
 ```
