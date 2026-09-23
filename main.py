@@ -296,22 +296,41 @@ def run_train(args):
             f"Pass a valid file with --data_path (cwd={os.getcwd()})"
         )
 
-    # Shuffle rows BEFORE the positional train/val split so both splits cover
-    # all antigens/classes (the CSV rows are not randomly ordered).
+    # Two supported CSV layouts:
+    #  * prepared files with a `split` column (SEPIQ): cluster-disjoint
+    #    train/val is taken verbatim from the file, --train_rate is ignored.
+    #  * legacy single-split CSVs (COVID/HIV): rows are shuffled (seeded) and
+    #    split positionally by --train_rate.
     df = pd.read_csv(args.data_path)
     df = df.dropna(subset=['H-FR1', 'H-CDR1', 'H-FR2', 'H-CDR2', 'H-FR3', 'H-CDR3', 'H-FR4'])
-    df = df.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
 
     # NOTE: the dataset constructor loads ESM-2 650M and 4 IgFold models onto
     # the GPU. Build the datasets FIRST, precompute all embeddings, and release
     # those encoders before allocating the training model.
-    train_dataset = antibody_antigen_dataset(antigen_config=antigen_config, antibody_config=antibody_config,
-                                              data=df, train=True, test=False, rate1=args.train_rate)
-    val_dataset = None
-    if args.train_rate < 1.0:
+    if 'split' in df.columns:
+        train_df = df[df['split'] == 'train'].sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+        val_df = df[df['split'] == 'val'].reset_index(drop=True)
+        if len(train_df) == 0 or len(val_df) == 0:
+            raise ValueError(f"split column in {args.data_path} must contain both "
+                             f"'train' and 'val' rows (got {len(train_df)}/{len(val_df)}).")
+        print(f"Using file-provided cluster-disjoint split: train={len(train_df)}, val={len(val_df)} "
+              f"(positional --train_rate={args.train_rate} ignored).")
+        train_dataset = antibody_antigen_dataset(antigen_config=antigen_config, antibody_config=antibody_config,
+                                                  data=train_df, train=True, test=False, rate1=1.0)
         val_dataset = antibody_antigen_dataset(antigen_config=antigen_config, antibody_config=antibody_config,
-                                                data=df, train=False, test=True, rate1=args.train_rate,
+                                                data=val_df, train=False, test=True, rate1=0.0,
                                                 share_encoders=train_dataset)
+    else:
+        # Shuffle rows BEFORE the positional train/val split so both splits
+        # cover all antigens/classes (the CSV rows are not randomly ordered).
+        df = df.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+        train_dataset = antibody_antigen_dataset(antigen_config=antigen_config, antibody_config=antibody_config,
+                                                  data=df, train=True, test=False, rate1=args.train_rate)
+        val_dataset = None
+        if args.train_rate < 1.0:
+            val_dataset = antibody_antigen_dataset(antigen_config=antigen_config, antibody_config=antibody_config,
+                                                    data=df, train=False, test=True, rate1=args.train_rate,
+                                                    share_encoders=train_dataset)
 
     print("Precomputing embeddings for train split...")
     train_dataset.precompute_embeddings()
@@ -366,9 +385,22 @@ def run_test(args):
         )
     print(args.data_path)
 
-    # rate1=0 with test=True selects the WHOLE csv (iloc[0:]).
+    # Prepared SEPIQ-style CSVs carry a cluster-disjoint `split` column; by
+    # default the test command evaluates the held-out 'val' rows only.
+    # --eval_split all keeps the legacy behavior (evaluate the WHOLE csv).
+    eval_df = pd.read_csv(args.data_path)
+    if 'split' in eval_df.columns and args.eval_split != 'all':
+        eval_df = eval_df[eval_df['split'] == args.eval_split].reset_index(drop=True)
+        if len(eval_df) == 0:
+            raise ValueError(f"No rows with split == '{args.eval_split}' in {args.data_path}.")
+        print(f"Evaluating split='{args.eval_split}': {len(eval_df)} rows.")
+        kwargs = {'data': eval_df}
+    else:
+        kwargs = {'data_path': args.data_path}
+
+    # rate1=0 with test=True selects the WHOLE csv/frame (iloc[0:]).
     test_dataset = antibody_antigen_dataset(antigen_config=antigen_config, antibody_config=antibody_config,
-                                            data_path=args.data_path, train=False, test=True, rate1=0)
+                                            train=False, test=True, rate1=0, **kwargs)
     print("Precomputing embeddings for test split...")
     test_dataset.precompute_embeddings()
     test_dataset.release_encoders()
@@ -410,9 +442,11 @@ def build_parser():
     common.add_argument('--model_name', type=str, default='AntiBinder',
                         help='name prefix for checkpoints (ckpts/<name>_best.pth) and logs')
     common.add_argument('--data_path', type=str,
-                        default='./datasets/process_data/COVID-19/Cov_with_target_split.csv',
-                        help='path to the split CSV; must contain H-FR1..H-FR4, vh, "Antigen", '
-                             '"Antigen Sequence" and ANT_Binding columns')
+                        default='./datasets/process_data/SEPIQ/AVIDa-hHER2_binary.csv',
+                        help='path to the prepared CSV; must contain H-FR1..H-FR4, vh, "Antigen", '
+                             '"Antigen Sequence" and ANT_Binding columns. A "split" column '
+                             '(train/val, e.g. from prepare_sepiq.py) enables cluster-disjoint '
+                             'train/val handling')
 
     parser = argparse.ArgumentParser(
         prog='python main.py',
@@ -430,8 +464,10 @@ def build_parser():
                     'is selected on validation F1 and saved to ckpts/<model_name>_best.pth. '
                     'Training auto-resumes from that file unless --fresh is given.',
         epilog='examples:\n'
-               '  python main.py train\n'
+               '  # SEPIQ AVIDa-hHER2 (run prepare_sepiq.py first)\n'
+               '  python main.py train --data_path ./datasets/process_data/SEPIQ/AVIDa-hHER2_binary.csv\n'
                '  python main.py train --epochs 100 --batch_size 64 --lr 6e-5\n'
+               '  # legacy CSV without a split column\n'
                '  python main.py train --train_rate 1.0          # no val split, select on train loss\n'
                '  python main.py train --fresh                   # ignore existing checkpoint')
     p_train.add_argument('--data', type=str, default='train',
@@ -460,16 +496,23 @@ def build_parser():
     # ---- test ----
     p_test = sub.add_parser(
         'test', parents=[common], formatter_class=fmt,
-        help='evaluate the best checkpoint on a CSV',
-        description='Evaluate ckpts/<model_name>_best.pth on the ENTIRE CSV given by --data_path. '
-                    'Reports ROC-AUC, accuracy, precision, recall, F1 and the TN/FP/FN/TP confusion '
-                    'matrix, and appends one row to logs/<model_name>_<latent_dim>_test.csv. '
-                    'Embeddings are precomputed/cached first as in training.',
+        help='evaluate the best checkpoint on a CSV (val split by default)',
+        description='Evaluate ckpts/<model_name>_best.pth on the CSV given by --data_path. '
+                    'When the CSV has a "split" column (prepare_sepiq.py output), only the '
+                    "held-out 'val' rows are evaluated by default (--eval_split val); use "
+                    "--eval_split all for the ENTIRE CSV. Reports ROC-AUC, accuracy, precision, "
+                    'recall, F1 and the TN/FP/FN/TP confusion matrix, and appends one row to '
+                    'logs/<model_name>_<latent_dim>_test.csv. Embeddings are precomputed/cached '
+                    'first as in training.',
         epilog='examples:\n'
                '  python main.py test\n'
+               '  python main.py test --eval_split all\n'
                '  python main.py test --data_path ./datasets/process_data/HIV/dataset_hiv_split.csv')
     p_test.add_argument('--data', type=str, default='test',
                         help='label used in the test log file name')
+    p_test.add_argument('--eval_split', choices=['val', 'train', 'all'], default='val',
+                        help="which rows to evaluate when the CSV contains a 'split' column; "
+                             "'all' ignores the column (legacy behavior)")
     p_test.set_defaults(func=run_test)
 
     return parser

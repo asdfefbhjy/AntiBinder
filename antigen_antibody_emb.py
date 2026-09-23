@@ -34,7 +34,9 @@ class antibody_antigen_dataset(nn.Module):
         print (data_path)
         if isinstance(data,pd.DataFrame):
             df = data
-            df = df.dropna()
+            # Only the region columns are required downstream; extra metadata
+            # columns (Cluster, split, ...) must not drop rows when NaN.
+            df = df.dropna(subset=['H-FR1','H-CDR1','H-FR2','H-CDR2','H-FR3','H-CDR3','H-FR4'])
         else:
             df = pd.read_csv(data_path)## samples of data, attention to your file type
             # df = df.dropna()

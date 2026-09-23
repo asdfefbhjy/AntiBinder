@@ -1,14 +1,21 @@
-beautifulsoup4 
-biopython 
-biotite 
-bs4 
+beautifulsoup4
+biopython
+biotite
+bs4
 fair-esm
-idna 
-igfold 
-lmdb 
-logomaker 
-ml-collections 
-scikit-learn 
-seaborn 
-six 
-tqdm 
+idna
+igfold
+lmdb
+logomaker
+ml-collections
+scikit-learn
+seaborn
+six
+tqdm
+
+# Optional (SEPIQ preprocessing, prepare_sepiq.py):
+# abnumber gives canonical ANARCI Chothia FR/CDR splitting, but also needs the
+# system HMMER binary (on Kaggle: !apt-get install -y hmmer).
+# Without both, prepare_sepiq.py falls back to its built-in anchor splitter
+# (>=99.5% of AVIDa-hHER2 VHHs; Chothia-exact CDR3 boundary).
+abnumber
