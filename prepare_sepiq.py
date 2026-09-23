@@ -232,13 +232,13 @@ def abnumber_split(seq):
 # Kaggle input path discovery
 # ---------------------------------------------------------------------------
 def resolve_kaggle_path(path, filename):
-    """Return ``path`` if it exists, otherwise search every attached Kaggle
-    dataset folder for ``filename`` (the folder name is the dataset slug,
-    which may differ from the assumed default). Returns the original path
+    """Return ``path`` if it exists, otherwise recursively search every
+    attached Kaggle dataset for ``filename``. Returns the original path
     unchanged when nothing is found so the caller reports a clear error."""
     if path and os.path.exists(path):
         return path
-    hits = sorted(glob.glob(os.path.join(KAGGLE_INPUT_DIR, '*', filename)))
+    pattern = os.path.join(KAGGLE_INPUT_DIR, '**', filename)
+    hits = sorted(glob.glob(pattern, recursive=True))
     return hits[0] if hits else path
 
 
