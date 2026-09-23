@@ -9,6 +9,7 @@ lmdb
 logomaker
 ml-collections
 scikit-learn
+scipy
 seaborn
 six
 tqdm

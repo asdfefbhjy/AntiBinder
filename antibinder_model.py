@@ -174,11 +174,23 @@ class bicrossatt(nn.Module):
         self.alpha = nn.Parameter(torch.tensor([1.0]))
         self.latent_dim = latent_dim
 
-    def forward(self, antibody_seq_stru, antigen_seq_stru):
-        antibody_seq_stru,antigen_seq_stru = self.bidirectional_crossatt(antibody_seq_stru,antigen_seq_stru)
+    def forward_features(self, antibody_seq_stru, antigen_seq_stru):
+        """Cross-attend both chains and project to per-residue latent features.
+
+        Returns (antibody_feat, antigen_feat) WITHOUT pooling:
+            antibody_feat: (B, 149, latent_dim)
+            antigen_feat:  (B, 1024, latent_dim)
+        The original pair-level forward() pools these exact tensors, so the
+        pair path keeps identical numerics.
+        """
+        antibody_seq_stru, antigen_seq_stru = self.bidirectional_crossatt(antibody_seq_stru, antigen_seq_stru)
 
         antibody_seq_stru = self.change_dim(self.linear(self.LayerNorm(antibody_seq_stru)))
-        antigen_seq_stru = self.change_dim(self.linear(self.LayerNorm(antigen_seq_stru))) 
+        antigen_seq_stru = self.change_dim(self.linear(self.LayerNorm(antigen_seq_stru)))
+        return antibody_seq_stru, antigen_seq_stru
+
+    def forward(self, antibody_seq_stru, antigen_seq_stru):
+        antibody_seq_stru, antigen_seq_stru = self.forward_features(antibody_seq_stru, antigen_seq_stru)
 
         antibody_seq_stru = self.pool(antibody_seq_stru,self.latent_dim,is_antibody=True)
         antigen_seq_stru = self.pool(antigen_seq_stru,self.latent_dim,is_antibody=False)
@@ -211,6 +223,116 @@ class antibinder(nn.Module):
         concat_tensor = self.bicrossatt(antibody_seq_stru,antigen_seq_stru)
 
         return self.cls(concat_tensor)
+
+
+class ResidueHead(nn.Module):
+    """Per-residue interface logit from the latent per-residue features."""
+
+    def __init__(self, latent_dim, hidden=64) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x):
+        # x: (B, L, latent_dim) -> logits (B, L)
+        return self.net(x).squeeze(-1)
+
+
+class GatedAttentionMIL(nn.Module):
+    """Gated attention MIL pooling (Ilse et al., 2018).
+
+    A bag = one VHH-antigen pair; instances = residues. The attention produces
+    a bag embedding from the (masked) per-residue features, which a linear
+    layer turns into the pair logit. This lets pair-level labels supervise
+    per-residue heads: non-binders push ALL residue logits down while binders
+    must concentrate probability on a small paratope/epitope subset.
+    """
+
+    def __init__(self, latent_dim, hidden=64) -> None:
+        super().__init__()
+        self.V = nn.Linear(latent_dim, hidden)
+        self.U = nn.Linear(latent_dim, hidden)
+        self.w = nn.Linear(hidden, 1)
+
+    def forward(self, x, mask):
+        # x: (B, L, latent), mask: (B, L) bool, True = real residue
+        attn = self.w(torch.tanh(self.V(x)) * torch.sigmoid(self.U(x))).squeeze(-1)  # (B, L)
+        attn = attn.masked_fill(~mask, -1e9)  # -1e9 -> -inf under fp16, softmax-safe
+        attn = torch.softmax(attn, dim=1)     # (B, L) attention weights
+        bag = (attn.unsqueeze(-1) * x).sum(dim=1)  # (B, latent)
+        return bag, attn
+
+
+class antibinder_mil(nn.Module):
+    """AntiBinder with residue-level heads + MIL branch (SEPIQ Track A).
+
+    Shares the exact encoder/cross-attention backbone with `antibinder`, so a
+    pair-level checkpoint warm-starts this model (same parameter names). The
+    old `cls` head is kept as an auxiliary pair head but now emits LOGITS
+    (sigmoid moved to the loss, nn.BCEWithLogitsLoss).
+
+    forward(antibody, antigen) returns:
+        pair_logit      (B,)     MIL pair logit (gated attention over residues)
+        aux_pair_logit  (B,)     original pooled pair head logit
+        ab_res_logits   (B, 149) VHH paratope logits
+        ag_res_logits   (B, 1024) antigen epitope logits
+    """
+
+    def __init__(self, antibody_hidden_dim, antigen_hidden_dim, latent_dim, res=False) -> None:
+        super().__init__()
+        self.combined_embedding = Combine_Embedding(antibody_hidden_dim, antigen_hidden_dim)
+        self.bicrossatt = bicrossatt(antibody_hidden_dim, latent_dim, res)
+        # Auxiliary pair head on pooled features. Same layer names/shapes as
+        # antibinder.cls so old checkpoints load (Sigmoid had no parameters).
+        self.cls = nn.Sequential(
+            nn.Linear(latent_dim*latent_dim*2, latent_dim*latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim*latent_dim, 1),
+        )
+        # Residue-level heads (separate for epitope vs paratope biology).
+        self.res_head_ab = ResidueHead(latent_dim)
+        self.res_head_ag = ResidueHead(latent_dim)
+        # MIL pooling per chain, then a pair logit from both bag embeddings.
+        self.mil_ab = GatedAttentionMIL(latent_dim)
+        self.mil_ag = GatedAttentionMIL(latent_dim)
+        self.mil_pair = nn.Linear(latent_dim * 2, 1)
+        self.latent_dim = latent_dim
+
+    @staticmethod
+    def _valid_mask(token_ids):
+        # universal_padding fills with 0 and no amino acid maps to 0.
+        return token_ids != 0  # (B, L) bool
+
+    def forward(self, antibody, antigen):
+        # antibody: [ids, at_type, structure]; antigen: [ids, structure]
+        device = antibody[0].device
+        ab_mask = self._valid_mask(antibody[0].to(device))   # (B, 149)
+        ag_mask = self._valid_mask(antigen[0].to(device))    # (B, 1024)
+
+        ab_emb, ag_emb = self.combined_embedding(antibody, antigen)
+        ab_feat, ag_feat = self.bicrossatt.forward_features(ab_emb, ag_emb)
+
+        # Auxiliary pair logit on the pooled features (original pair path).
+        ab_pooled = self.bicrossatt.flatten(
+            self.bicrossatt.pool(ab_feat, self.latent_dim, is_antibody=True))
+        ag_pooled = self.bicrossatt.flatten(
+            self.bicrossatt.pool(ag_feat, self.latent_dim, is_antibody=False))
+        concat = torch.cat((ab_pooled, self.bicrossatt.alpha * ag_pooled), dim=-1)
+        aux_pair_logit = self.cls(concat).squeeze(-1)
+
+        # Residue-level logits.
+        ab_res_logits = self.res_head_ab(ab_feat)  # (B, 149)
+        ag_res_logits = self.res_head_ag(ag_feat)  # (B, 1024)
+
+        # MIL pair logit from gated-attention bag embeddings of both chains.
+        bag_ab, _ = self.mil_ab(ab_feat, ab_mask)
+        bag_ag, _ = self.mil_ag(ag_feat, ag_mask)
+        pair_logit = self.mil_pair(torch.cat((bag_ab, bag_ag), dim=-1)).squeeze(-1)  # (B,)
+
+        return pair_logit, aux_pair_logit, ab_res_logits, ag_res_logits
 
 
 if __name__ == "__main__":

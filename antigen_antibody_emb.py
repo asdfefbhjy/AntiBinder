@@ -27,10 +27,17 @@ class antibody_antigen_dataset(nn.Module):
                 test = False,
                 rate1 = 0.8,
                 data = None,
-                share_encoders = None) -> None:
+                share_encoders = None,
+                res_label_dir = None) -> None:
         super().__init__()
         self.antigen_config = antigen_config
         self.antibody_config = antibody_config
+        # res_label_dir: optional directory of <sample_id>.npz files with
+        # per-residue interface labels ('ab_label' at vh length, 'ag_label' at
+        # antigen length) for the structure-supervised stage. When set,
+        # __getitem__ returns a 5-tuple (see below) instead of a 3-tuple.
+        self.res_label_dir = res_label_dir
+        self.return_res_labels = res_label_dir is not None
         print (data_path)
         if isinstance(data,pd.DataFrame):
             df = data
@@ -99,7 +106,12 @@ class antibody_antigen_dataset(nn.Module):
 
     def __getitem__(self, index):
         data = self.data.iloc[index]
-        label = torch.tensor(data['ANT_Binding'])
+        # ANT_Binding is optional: the structure-supervised stage (SAbDab) has
+        # no pair-level label; a dummy 0 keeps the return signature stable.
+        if 'ANT_Binding' in self.data.columns and pd.notna(data['ANT_Binding']):
+            label = torch.tensor(int(data['ANT_Binding']))
+        else:
+            label = torch.tensor(0)
         if not os.path.exists('./antigen_esm/train/'+str(self.data.iloc[index]['Antigen'])+'.pt'):
             os.makedirs('./antigen_esm/train/', exist_ok=True)
             antigen = self.func_padding_for_esm(self.data['Antigen Sequence'].iloc[index], self.antigen_config.max_position_embeddings)
@@ -191,6 +203,25 @@ class antibody_antigen_dataset(nn.Module):
 
         antigen_structure = antigen_structure[:1024, :]
         # print(antigen_structure.shape)
+
+        if self.return_res_labels:
+            # Structure-supervised stage: load per-residue interface labels.
+            # Labels are stored at true sequence lengths and zero-padded to
+            # the model max lengths (0 = non-interface / padding). Float-safe
+            # padding (universal_padding casts to long).
+            def pad_float(t, max_length):
+                if t.numel() > max_length:
+                    return t[:max_length]
+                return torch.cat([t, torch.zeros(max_length - t.numel(), dtype=t.dtype)])
+            sample_id = str(data['sample_id'])
+            npz_path = os.path.join(self.res_label_dir, sample_id + '.npz')
+            res = np.load(npz_path)
+            ab_res = pad_float(torch.from_numpy(res['ab_label'].astype('float32')),
+                               self.antibody_config.max_position_embeddings)
+            ag_res = pad_float(torch.from_numpy(res['ag_label'].astype('float32')),
+                               self.antigen_config.max_position_embeddings)
+            return [antibody,at_type,antibody_structure],[antigen,antigen_structure],label,ab_res,ag_res
+
         return [antibody,at_type,antibody_structure],[antigen,antigen_structure],label
 
     def __len__(self):
