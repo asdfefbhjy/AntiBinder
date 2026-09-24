@@ -97,12 +97,10 @@ class Trainer():
             'metric_name': metric_name,
             metric_name: float(metric_value),
         }
-        # History file carrying the metric value, e.g. AntiBinder_valf1_0.6267.pth
-        metric_path = f"./ckpts/{self.args.model_name}_{metric_name}_{metric_value:.4f}.pth"
-        torch.save(payload, metric_path)
-        # Overwrite the stable "best" pointer with the same payload.
+        # Only keep a single stable "best" checkpoint; history files fill
+        # Kaggle's output disk very quickly.
         torch.save(payload, self.ckpt_path)
-        print(f"checkpoint saved: {metric_path} (also {self.ckpt_path})")
+        print(f"checkpoint saved: {self.ckpt_path} ({metric_name}={metric_value:.4f})")
 
     # ----- validation ------------------------------------------------------
     @torch.no_grad()
@@ -278,10 +276,10 @@ class ResidueTrainer():
             'metric_name': metric_name,
             metric_name: float(metric_value),
         }
-        metric_path = f"./ckpts/{self.args.model_name}_{metric_name}_{metric_value:.4f}.pth"
-        torch.save(payload, metric_path)
+        # Only keep a single stable "best" checkpoint; history files fill
+        # Kaggle's output disk very quickly.
         torch.save(payload, self.ckpt_path)
-        print(f"checkpoint saved: {metric_path} (also {self.ckpt_path})")
+        print(f"checkpoint saved: {self.ckpt_path} ({metric_name}={metric_value:.4f})")
 
     # ----- losses ----------------------------------------------------------
     def _mil_loss(self, batch):
