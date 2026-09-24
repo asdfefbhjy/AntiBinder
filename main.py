@@ -740,6 +740,13 @@ def run_predict(args):
     else:
         templates = sorted(glob.glob(args.template_dir))
     if not templates:
+        # Kaggle mount layout varies by account (e.g.
+        # /kaggle/input/sepiq-2026-training-data vs
+        # /kaggle/input/datasets/kolsmirnov/sepiq-2026-training-data); fall
+        # back to a recursive search over every attached dataset.
+        templates = sorted(glob.glob(
+            '/kaggle/input/**/prediction_template_ONU*.csv', recursive=True))
+    if not templates:
         raise FileNotFoundError(f"No prediction_template_ONU*.csv under {args.template_dir}")
     print(f"Found {len(templates)} templates: {[os.path.basename(t) for t in templates]}")
 
@@ -939,7 +946,8 @@ def build_parser():
                '--out_dir ./predictions')
     p_pred.add_argument('--template_dir', type=str,
                         default='/kaggle/input/sepiq-2026-training-data',
-                        help='directory containing prediction_template_ONU*.csv (or a glob pattern)')
+                        help='directory containing prediction_template_ONU*.csv (or a glob '
+                             'pattern); auto-searched recursively under /kaggle/input/')
     p_pred.add_argument('--out_dir', type=str, default='./predictions',
                         help='output directory for <name>_prediction.csv files')
     p_pred.set_defaults(func=run_predict)
