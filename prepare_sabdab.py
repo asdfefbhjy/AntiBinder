@@ -1,51 +1,88 @@
-"""Stage-1 data preparation: per-residue interface labels from SAbDab-nano.
+"""Stage-1 data preparation: per-residue interface labels from the official
+SAbDab2 Machine Learning Dataset (Zenodo record 22019991, v0.2.0).
 
-Builds the residue-supervised (task=struct) training set for SEPIQ Track A:
-for each VHH-antigen structure we compute inter-chain heavy-atom contacts and
-store per-residue binary interface labels, aligned with the sequence positions
-the model actually consumes.
+Why this source
+---------------
+The legacy OPIg SAbDab(-nano) summary endpoints were retired when SAbDab2 was
+rebuilt (https://sabdab2.opig.stats.ox.ac.uk/). OPIG now publish a single
+curated ML bundle on Zenodo:
+
+    https://zenodo.org/records/22019991
+    splits.tar.gz  (~889 MB, md5 ada2fdd573418877d7eaa87afe92044e)
+
+It contains 15,810 pre-cropped structure files, including 3,318 single-domain
+(VHH-like) antibodies (~2,083 with an antigen), plus standardised
+sequence-clustered train/test splits. We use the antigen-aware single-domain
+split (``abag_split_sd.csv``): antibody AND antigen sequence similarity were
+considered, so train/test leakage on either side is prevented upstream.
+
+File naming inside the archive::
+
+    splits_final/pdb_<index><pdbid>_<abChain1>_<abChain2>.cif
+    e.g. pdb_00007zml_E_+.cif   -> VHH (single heavy) chain E, '+' = no light
+         pdb_00002a6j_H_L.cif  -> conventional Fv (ignored here)
+
+Each file keeps the antibody variable region and the (possibly cropped)
+antigen chain coordinates; apo VHH files simply have no other polymer chain.
 
 Outputs (under --out_dir):
-  sabdab_nano.csv   master CSV (H-FR1..H-FR4, vh, Antigen, Antigen Sequence,
-                    sample_id, split) consumable by `main.py train --task struct`
-  res_labels/<sample_id>.npz   per-sample labels:
-                    ab_label: (len(vh),)  float32 0/1 paratope
-                    ag_label: (len(ag),)  float32 0/1 epitope
+  sabdab_nano.csv          columns consumed by `main.py train --task struct`
+                           (H-FR1..H-FR4, vh, Antigen, Antigen Sequence,
+                            sample_id, pdb, split=train/val)
+  res_labels/<sample_id>.npz
+                           ab_label: (len(vh),) float32 0/1 paratope
+                           ag_label: (len(ag),) float32 0/1 epitope
 
-Usage (Kaggle, internet on):
+The validation split is carved out of the OFFICIAL train structures by
+unique antigen sequence (seeded), so no antigen (or near-identical antigen,
+thanks to abag clustering) crosses train/val. Official test structures are
+excluded by default (pass --include_official_test to fold them into train for
+a final submission model).
+
+Kaggle usage (internet ON, biopython installed)::
+
     !pip install biopython -q
-    # 1) try to fetch the SAbDab-nano summary (server can be slow; several min)
-    !python prepare_sabdab.py --fetch-summary --out_dir ./datasets/process_data/SAbDab
-    # 2) download structures + build labels
     !python prepare_sabdab.py --out_dir ./datasets/process_data/SAbDab
+    !python main.py train --task struct --model_name sabdabstruct \
+        --data_path ./datasets/process_data/SAbDab/sabdab_nano.csv \
+        --res_label_dir ./datasets/process_data/SAbDab/res_labels
 
-Offline mode: place a SAbDab summary CSV (columns pdb, Hchain, Lchain,
-antigen_chain) at --summary and pre-downloaded *.cif[.gz] files in --pdb_dir.
+Offline mode: pre-download splits.tar.gz yourself and pass --archive.
 """
 import argparse
-import gzip
 import hashlib
+import io
 import os
 import random
+import re
 import shutil
-import sys
+import subprocess
+import tarfile
+import time
 import urllib.request
-import zlib
 
 import numpy as np
 import pandas as pd
 
 from prepare_sepiq import anchor_split
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+ZENODO_URL = 'https://zenodo.org/records/22019991/files/splits.tar.gz?download=1'
+ZENODO_MD5 = 'ada2fdd573418877d7eaa87afe92044e'  # v0.2.0 (20 Aug 2026)
+
 REGION_COLS = ['H-FR1', 'H-CDR1', 'H-FR2', 'H-CDR2', 'H-FR3', 'H-CDR3', 'H-FR4']
 MAX_VH_LEN = 149          # model antibody max length
+MIN_VH_LEN = 90
 MAX_AG_LEN = 1000         # keep margin below the 1024 ESM window
+MIN_AG_LEN = 20
+MIN_CONTACTS = 3          # require a real interface on each side
 CONTACT_DIST = 5.0        # heavy-atom contact cutoff (Angstrom)
 
-SUMMARY_URLS = [
-    'https://opig.stats.ox.ac.uk/webapps/newsabdab/sabdab/nanobodies/summary/all/',
-    'https://opig.stats.ox.ac.uk/webapps/sabdab/summary/all',
-]
+# pdb_00007zml_E_+.cif  ->  ('7zml', 'E', '+')
+MEMBER_RE = re.compile(
+    r'^pdb_(?P<idx>\d{4})(?P<pdb>[0-9a-z]{4})_(?P<c1>[^_]+)_(?P<c2>[^_]+)\.cif$')
 
 THREE2ONE = {
     'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C', 'GLN': 'Q',
@@ -53,89 +90,93 @@ THREE2ONE = {
     'MET': 'M', 'PHE': 'F', 'PRO': 'P', 'SER': 'S', 'THR': 'T', 'TRP': 'W',
     'TYR': 'Y', 'VAL': 'V', 'MSE': 'M', 'SEC': 'U', 'PYL': 'O',
 }
-NO_LIGHT = {'', 'NA', 'N/A', 'NAN', '-', 'NONE', '.'}
 
 
 # ---------------------------------------------------------------------------
-# summary handling
+# Download (stdlib-first; curl fallback) with resume + md5 verification
 # ---------------------------------------------------------------------------
-def fetch_summary(out_path):
-    """Try known SAbDab summary endpoints; the OPIg server generates the file
-    on demand and can take several minutes, hence the long timeout."""
-    for url in SUMMARY_URLS:
+def _md5(path, chunk=1 << 20):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(chunk), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _download_urllib(url, dst, pos):
+    headers = {'User-Agent': 'Mozilla/5.0 (compatible; AntiBinder-prep/1.0)',
+               'Accept': 'application/octet-stream,*/*;q=0.8'}
+    if pos:
+        headers['Range'] = f'bytes={pos}-'
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=120) as r, open(dst, 'ab') as f:
+        shutil.copyfileobj(r, f, length=1 << 20)
+
+
+def _download_curl(url, dst, pos):
+    cmd = ['curl', '-fL', '--retry', '3', '--connect-timeout', '60',
+           '--output', dst, url]
+    if pos:
+        cmd[-1:-1] = ['-C', '-']  # resume
+    subprocess.run(cmd, check=True)
+
+
+def download_archive(dst):
+    """Download (resumably) the Zenodo bundle and verify the md5."""
+    if os.path.exists(dst) and os.path.getsize(dst) > 0:
+        print(f'[download] found existing archive ({os.path.getsize(dst)/1e6:.0f} MB), '
+              f'verifying md5...')
+        if _md5(dst) == ZENODO_MD5:
+            print('[download] md5 OK, reusing.')
+            return dst
+        print('[download] md5 mismatch / partial file; resuming download.')
+
+    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+    part = dst + '.part'
+    pos = os.path.getsize(part) if os.path.exists(part) else 0
+    backoff = 10
+    for attempt in range(6):
         try:
-            print(f'[summary] downloading {url} (this can take minutes)...')
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=1800) as r:
-                data = r.read()
-            with open(out_path, 'wb') as f:
-                f.write(data)
-            print(f'[summary] saved {len(data)/1e6:.1f} MB -> {out_path}')
-            return out_path
+            print(f'[download] urllib GET {url_clip(ZENODO_URL)} (resume @ {pos/1e6:.0f} MB)')
+            _download_urllib(ZENODO_URL, part, pos)
+            break
         except Exception as exc:
-            print(f'[summary] FAILED {url}: {exc}')
-    print('[summary] All endpoints failed. Download the SAbDab-nano summary manually from '
-          'https://opig.stats.ox.ac.uk/webapps/newsabdab/sabdab/nanobodies/ '
-          '(or https://opig.stats.ox.ac.uk/webapps/sabdab/) and pass it via --summary.')
-    return None
+            print(f'[download] urllib failed ({type(exc).__name__}: {exc}); '
+                  f'trying curl in {backoff}s ...')
+            try:
+                _download_curl(ZENODO_URL, part, pos)
+                break
+            except Exception as exc2:
+                print(f'[download] curl failed ({type(exc2).__name__}: {exc2}); '
+                      f'retry {attempt+1}/6 in {backoff}s')
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 120)
+                pos = os.path.getsize(part) if os.path.exists(part) else 0
+    else:
+        raise RuntimeError('Could not download splits.tar.gz from Zenodo after retries.')
+
+    if _md5(part) != ZENODO_MD5:
+        raise RuntimeError(f'Downloaded archive md5 mismatch (expected {ZENODO_MD5}). '
+                           f'Delete {part} and retry.')
+    shutil.move(part, dst)
+    print(f'[download] complete: {dst} ({os.path.getsize(dst)/1e6:.0f} MB)')
+    return dst
 
 
-def pick_col(df, candidates):
-    lower = {c.lower().replace('_', ''): c for c in df.columns}
-    for cand in candidates:
-        key = cand.lower().replace('_', '')
-        if key in lower:
-            return lower[key]
-    return None
-
-
-def is_missing(value):
-    return str(value).strip().upper() in NO_LIGHT or pd.isna(value)
-
-
-def load_complex_list(summary_path):
-    """Filter the summary down to single-domain-antibody (nanobody/VHH) +
-    single-antigen-chain complexes."""
-    df = pd.read_csv(summary_path, sep=None, engine='python', nrows=None)
-    df.columns = [str(c).strip() for c in df.columns]
-    c_pdb = pick_col(df, ['pdb', 'pdbcode'])
-    c_h = pick_col(df, ['Hchain', 'heavychain'])
-    c_l = pick_col(df, ['Lchain', 'lightchain'])
-    c_ag = pick_col(df, ['antigenchain', 'agchain', 'antigenchains'])
-    if not all([c_pdb, c_h, c_ag]):
-        raise ValueError(f'Summary {summary_path} lacks pdb/Hchain/antigen_chain columns; '
-                         f'found: {list(df.columns)[:20]}')
-    c_l = c_l or '__none__'
-    df[c_pdb] = df[c_pdb].astype(str).str.strip()
-    keep = []
-    for _, r in df.iterrows():
-        pdb = r[c_pdb]
-        hchain = r.get(c_h)
-        ag = r.get(c_ag)
-        if is_missing(pdb) or is_missing(hchain) or is_missing(ag):
-            continue
-        lchain = r.get(c_l, 'NA') if c_l != '__none__' else 'NA'
-        if not is_missing(lchain):
-            continue  # paired light chain -> conventional antibody, skip
-        ag_chains = [c for c in str(ag).replace(';', ',').split(',') if c.strip()]
-        ag_chains = [c.strip() for c in ag_chains if not is_missing(c)]
-        if len(ag_chains) != 1:
-            continue  # multi-chain antigen: keep the label space unambiguous
-        keep.append({'pdb': pdb.lower(), 'Hchain': str(hchain).strip(), 'ag_chain': ag_chains[0]})
-    entries = pd.DataFrame(keep).drop_duplicates(subset=['pdb']).reset_index(drop=True)
-    print(f'[summary] {len(df)} rows -> {len(entries)} nanobody + single-antigen complexes')
-    return entries
+def url_clip(u):
+    return u.split('?')[0]
 
 
 # ---------------------------------------------------------------------------
-# structure parsing / contacts
+# Structure parsing / contacts
 # ---------------------------------------------------------------------------
 def chain_sequence_and_atoms(chain):
     """Sequence (one-letter, file order) + per-residue heavy-atom coordinate
-    arrays for a Bio.PDB chain. Non-standard residues are skipped (MSE->M)."""
+    arrays for a Bio.PDB chain. Water/ligand HETATM residues are skipped
+    (MSE -> M)."""
     seq, coords = [], []
     for res in chain:
-        hetflag, resnum, icode = res.id
+        hetflag = res.id[0]
         if hetflag.strip() and res.get_resname() != 'MSE':
             continue
         three = res.get_resname().upper()
@@ -150,101 +191,130 @@ def chain_sequence_and_atoms(chain):
 
 
 def contact_pairs(coords_a, coords_b, dist=CONTACT_DIST):
-    """Index sets of residues in A/B that have any heavy-atom pair < dist."""
-    from scipy.spatial import cKDTree  # scipy ships with most ML environments
+    """Index sets of residues in A/B with any heavy-atom pair < dist."""
+    from scipy.spatial import cKDTree
     tree_b = cKDTree(np.concatenate(coords_b, axis=0))
     sizes_b = [len(c) for c in coords_b]
-    offsets_b = np.concatenate([[0], np.cumsum(sizes_b)])
-    b_res_of_atom = np.concatenate([np.full(n, i, dtype=np.int32) for i, n in enumerate(sizes_b)])
+    b_res_of_atom = np.concatenate(
+        [np.full(n, i, dtype=np.int32) for i, n in enumerate(sizes_b)])
 
     contact_a, contact_b = set(), set()
     for i, ca in enumerate(coords_a):
         pairs = tree_b.query_ball_point(ca, r=dist)
-        hits = sorted({b_res_of_atom[j] for sub in pairs for j in sub})
+        hits = {b_res_of_atom[j] for sub in pairs for j in sub}
         if hits:
             contact_a.add(i)
             contact_b.update(hits)
     return contact_a, contact_b
 
 
-def download_structure(pdb_id, pdb_dir):
-    """Download (and cache) the mmcif for a PDB entry. Returns a local path or
-    None."""
-    os.makedirs(pdb_dir, exist_ok=True)
-    for suffix in ('.cif.gz', '.cif'):
-        path = os.path.join(pdb_dir, pdb_id + suffix)
-        if os.path.exists(path):
-            return path
-    url = f'https://files.rcsb.org/download/{pdb_id}.cif.gz'
-    path = os.path.join(pdb_dir, pdb_id + '.cif.gz')
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=120) as r, open(path, 'wb') as f:
-            shutil.copyfileobj(r, f)
-        return path
-    except Exception as exc:
-        print(f'  [download] {pdb_id} failed: {exc}')
-        return None
-
-
-def parse_contacts(cif_path, hchain_id, ag_chain_id):
-    """(vh_seq, ag_seq, ab_contact_idx, ag_contact_idx) or (None, reason)."""
-    from Bio.PDB import MMCIFParser, PDBParser
-    if cif_path.endswith('.gz'):
-        with open(cif_path, 'rb') as fh:
-            raw = fh.read()
-        try:
-            raw = gzip.decompress(raw)
-        except (gzip.BadGzipFile, zlib.error):
-            pass  # already plain text
-        tmp = cif_path[:-3] if cif_path.endswith('.gz') else cif_path
-        if not os.path.exists(tmp):
-            with open(tmp, 'wb') as f:
-                f.write(raw)
-        cif_path = tmp
-        parser = MMCIFParser(QUIET=True)
-    else:
-        ext = os.path.splitext(cif_path)[1].lower()
-        parser = MMCIFParser(QUIET=True) if ext == '.cif' else PDBParser(QUIET=True)
-    structure = parser.get_structure('x', cif_path)
+def extract_vhh(text, ab_chain):
+    """Parse one SAbDab2 cif. Returns (vh_seq, candidates) where candidates is
+    a list of (chain_id, ag_seq, ab_contact_idx, ag_contact_idx) computed for
+    EVERY polymer chain other than the VHH (the curated subset is selected at
+    join time). Returns (None, reason) when the VHH chain is unusable."""
+    from Bio.PDB import MMCIFParser
+    parser = MMCIFParser(QUIET=True)
+    structure = parser.get_structure('x', io.StringIO(text))
     model = next(structure.get_models())
 
-    chains = {ch.id.strip(): ch for ch in model}
-    if hchain_id not in chains or ag_chain_id not in chains:
-        return None, f'chains {hchain_id}/{ag_chain_id} not in {list(chains)[:6]}'
+    vh = None
+    raw_cands = []
+    for ch in model:
+        seq, coords = chain_sequence_and_atoms(ch)
+        if not seq:
+            continue
+        if ch.id == ab_chain:
+            vh = (seq, coords)
+        elif 5 <= len(seq) <= MAX_AG_LEN:
+            # README: retained polymer antigen chains are >= 5 standard,
+            # contiguous residues (includes short PEPTIDE antigens).
+            raw_cands.append((ch.id, seq, coords))
 
-    vh_seq, vh_coords = chain_sequence_and_atoms(chains[hchain_id])
-    ag_seq, ag_coords = chain_sequence_and_atoms(chains[ag_chain_id])
-    if not (90 <= len(vh_seq) <= MAX_VH_LEN):
-        return None, f'vh length {len(vh_seq)} out of range'
-    if len(ag_seq) < 20 or len(ag_seq) > MAX_AG_LEN:
-        return None, f'antigen length {len(ag_seq)} out of range'
-
-    ab_idx, ag_idx = contact_pairs(vh_coords, ag_coords)
-    if len(ab_idx) < 3 or len(ag_idx) < 3:
-        return None, f'too few contacts (ab={len(ab_idx)}, ag={len(ag_idx)})'
-    return (vh_seq, ag_seq, ab_idx, ag_idx), None
+    if vh is None or not (MIN_VH_LEN <= len(vh[0]) <= MAX_VH_LEN):
+        return None, f'no VHH chain {ab_chain!r} in {MIN_VH_LEN}-{MAX_VH_LEN} aa range'
+    vh_seq, vh_coords = vh
+    candidates = []
+    for ch_id, ag_seq, ag_coords in raw_cands:
+        ab_idx, ag_idx = contact_pairs(vh_coords, ag_coords)
+        candidates.append((ch_id, ag_seq, ab_idx, ag_idx))
+    return (vh_seq, candidates), None
 
 
 # ---------------------------------------------------------------------------
-# main pipeline
+# Official split metadata (abag_split_sd.csv; schema documented in README.md)
+# ---------------------------------------------------------------------------
+SD_CSV = 'abag_split_sd.csv'
+META_COLS = ['INSTANCE', 'type', 'holo', 'Hchain', 'agchains', 'agtypes',
+             'agresolvedseqs', 'ab_ag_split']
+POLYMER_TYPES = {'PROTEIN', 'PEPTIDE'}  # residue-level epitope labels need a
+#                                       polymer antigen (DNA/RNA/sugar/hapten/
+#                                       ion complexes are excluded)
+
+
+def load_sd_metadata(csv_blobs):
+    """Parse the single-domain ab-ag split into {INSTANCE: meta}.
+
+    The CSV ships heavy python-list numbering columns (26 MB), so read only
+    the documented columns as strings. See README.md in the archive."""
+    if SD_CSV not in csv_blobs:
+        raise RuntimeError(f'{SD_CSV} missing from archive (found: '
+                           f'{sorted(csv_blobs)})')
+    df = pd.read_csv(io.StringIO(csv_blobs[SD_CSV]), usecols=META_COLS,
+                     dtype=str).fillna('')
+    meta = {}
+    counts = {'sdh_holo_polymer': 0, 'sdh_other': 0, 'sdl': 0}
+    for r in df.to_dict('records'):
+        inst = r['INSTANCE'].strip()
+        stype = r['type'].strip().upper()
+        if stype == 'SD-L':
+            counts['sdl'] += 1
+            continue
+        holo = r['holo'].strip().upper() == 'TRUE'
+        ag_chains = [c.strip() for c in r['agchains'].split('/') if c.strip()]
+        ag_types = [t.strip().upper() for t in r['agtypes'].split('/')]
+        poly = [(c, t) for c, t in zip(ag_chains, ag_types)
+                if t in POLYMER_TYPES]
+        split = r['ab_ag_split'].strip().lower()
+        meta[inst] = {
+            'split': split,
+            'holo': holo,
+            'poly': poly,  # [(author_chain_id, 'PROTEIN'|'PEPTIDE'), ...]
+            'all_ag_chains': ag_chains,
+        }
+        if stype == 'SD-H' and holo and poly:
+            counts['sdh_holo_polymer'] += 1
+        elif stype == 'SD-H':
+            counts['sdh_other'] += 1
+    print(f'[split] {SD_CSV}: {counts}')
+    n_train = sum(1 for m in meta.values()
+                  if m['split'] == 'train' and m['holo'] and m['poly'])
+    n_test = sum(1 for m in meta.values()
+                 if m['split'] == 'test' and m['holo'] and m['poly'])
+    print(f'[split] holo SD-H + polymer antigen: train={n_train}, test={n_test}')
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--summary', default=None,
-                    help='path to a SAbDab(-nano) summary CSV; combined with --fetch-summary '
-                         'this is where the download is stored')
-    ap.add_argument('--fetch-summary', action='store_true',
-                    help='download the SAbDab-nano summary before processing')
-    ap.add_argument('--pdb_dir', default='./sabdab_structures',
-                    help='cache directory for downloaded mmcif files')
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--archive', default='./sabdab_structures/splits.tar.gz',
+                    help='path to splits.tar.gz (downloaded here if missing)')
     ap.add_argument('--out_dir', default='./datasets/process_data/SAbDab',
-                    help='output directory (CSV + res_labels/npz)')
-    ap.add_argument('--max_structures', type=int, default=3000,
-                    help='cap on complexes processed (None-safe memory/time budget)')
+                    help='output directory (CSV + res_labels/*.npz)')
+    ap.add_argument('--skip_download', action='store_true',
+                    help='do not attempt any download (--archive must exist)')
+    ap.add_argument('--include_official_test', action='store_true',
+                    help='fold the official TEST structures into training data '
+                         '(for a final submission model; they are excluded by default)')
     ap.add_argument('--val_ratio', type=float, default=0.15,
-                    help='fraction of unique ANTIGENS held out for validation')
+                    help='fraction of unique antigens from OFFICIAL train used '
+                         'for the validation split')
+    ap.add_argument('--max_structures', type=int, default=None,
+                    help='optional cap on kept complexes (debugging)')
     ap.add_argument('--seed', type=int, default=42)
     args = ap.parse_args()
 
@@ -252,80 +322,201 @@ def main():
     res_dir = os.path.join(args.out_dir, 'res_labels')
     os.makedirs(res_dir, exist_ok=True)
 
-    summary_path = args.summary or os.path.join(args.pdb_dir, 'sabdab_summary.csv')
-    if args.fetch_summary:
-        got = fetch_summary(summary_path)
-        if got is None:
-            sys.exit(1)
-    if not os.path.exists(summary_path):
-        raise FileNotFoundError(
-            f'Summary CSV not found: {summary_path}. Run with --fetch-summary (internet) '
-            f'or download it manually and pass --summary.')
+    if not args.skip_download:
+        archive = download_archive(args.archive)
+    else:
+        archive = args.archive
+        if not os.path.exists(archive):
+            raise FileNotFoundError(f'--archive not found: {archive}')
 
-    entries = load_complex_list(summary_path)
-    if args.max_structures and len(entries) > args.max_structures:
-        entries = entries.sample(n=args.max_structures, random_state=args.seed)
-        print(f'[cap] sampled {len(entries)} complexes (--max_structures)')
+    # ---- one streaming pass over the gzip tar -----------------------------
+    # All single-domain-heavy cifs are parsed (the split CSV sits at the END
+    # of the archive, so metadata is not available yet); only tiny sequences
+    # and contact index sets are retained, not the raw cif text.
+    records = {}          # INSTANCE (exact case) -> (pdb, ab_chain, vh_seq, candidates)
+    csv_blobs = {}        # basename -> text
+    skipped = {}
+    n_seen = n_vhh = 0
 
-    rows, skipped = [], {}
-    for n, ent in enumerate(entries.to_dict('records')):
-        pdb, hchain, ag_chain = ent['pdb'], ent['Hchain'], ent['ag_chain']
-        sample_id = f"{pdb}_{hchain}"
-        if (n + 1) % 100 == 0:
-            print(f'... {n+1}/{len(entries)} (kept {len(rows)}, skipped {sum(skipped.values())})')
-        npz_path = os.path.join(res_dir, sample_id + '.npz')
-        if os.path.exists(npz_path):
-            pass  # recompute anyway is cheap only w/o download; keep simple: reuse cache below
-        cif = download_structure(pdb, args.pdb_dir)
-        if cif is None:
-            skipped['download'] = skipped.get('download', 0) + 1
+    with tarfile.open(archive, mode='r:gz') as tf:
+        for member in tf:
+            if not member.isfile():
+                continue
+            base = os.path.basename(member.name)
+            n_seen += 1
+            if n_seen % 2000 == 0:
+                print(f'... scanned {n_seen} files, VHH parsed {len(records)} '
+                      f'(skipped {sum(skipped.values())})')
+
+            if base.endswith(('.csv', '.md', '.txt')):
+                f = tf.extractfile(member)
+                if f is not None:
+                    csv_blobs[base] = f.read().decode('utf-8', errors='replace')
+                continue
+
+            m = MEMBER_RE.match(base)
+            if m is None or m.group('c2') != '+':
+                continue  # conventional Fv, single-domain light, or other file
+            n_vhh += 1
+            f = tf.extractfile(member)
+            if f is None:
+                continue
+            text = f.read().decode('utf-8', errors='replace')
+            try:
+                result, reason = extract_vhh(text, m.group('c1'))
+            except Exception as exc:
+                result, reason = None, f'{type(exc).__name__}: {exc}'
+            if result is None:
+                key = reason.split(' ')[0]
+                skipped[key] = skipped.get(key, 0) + 1
+                continue
+            vh_seq, candidates = result
+            records[base[:-4]] = (m.group('pdb'), m.group('c1'),
+                                  vh_seq, candidates)
+
+    print(f'\n[tar] scanned {n_seen} files; {n_vhh} single-domain-heavy members, '
+          f'{len(records)} parsed successfully.')
+    print(f'[tar] parse skips: {skipped}')
+    print(f'[tar] metadata files: {sorted(csv_blobs)}')
+
+    # ---- join the official ab-ag single-domain metadata -------------------
+    meta = load_sd_metadata(csv_blobs)
+    rows = []
+    join_skip = {}
+    n_test = 0
+    for inst, info in meta.items():
+        if not info['holo'] or not info['poly']:
+            continue  # apo VHH or non-polymer antigen only (sugar/hapten/...)
+        if info['split'] not in ('train', 'test'):
+            join_skip[f"split={info['split']}"] = join_skip.get(
+                f"split={info['split']}", 0) + 1
             continue
-        try:
-            result, reason = parse_contacts(cif, hchain, ag_chain)
-        except Exception as exc:
-            result, reason = None, f'{type(exc).__name__}: {exc}'
-        if result is None:
-            skipped['parse'] = skipped.get('parse', 0) + 1
-            if reason and (n < 10 or skipped['parse'] <= 10):
-                print(f'  [skip] {sample_id}: {reason}')
+        if info['split'] == 'test' and not args.include_official_test:
+            n_test += 1
             continue
-        vh_seq, ag_seq, ab_idx, ag_idx = result
+        rec = records.get(inst)
+        if rec is None:
+            join_skip['cif_not_parsed'] = join_skip.get('cif_not_parsed', 0) + 1
+            continue
+        pdb, ab_chain, vh_seq, candidates = rec
+        type_by_chain = dict(info['poly'])
+        # Restrict to curated PROTEIN/PEPTIDE chains; proteins >= MIN_AG_LEN,
+        # short PEPTIDE antigens allowed down to 5 residues.
+        eligible = [
+            (cid, seq, ab_idx, ag_idx)
+            for cid, seq, ab_idx, ag_idx in candidates
+            if cid in type_by_chain
+            and (type_by_chain[cid] == 'PEPTIDE' or len(seq) >= MIN_AG_LEN)]
+        if not eligible:
+            join_skip['no_curated_chain_coords'] = join_skip.get(
+                'no_curated_chain_coords', 0) + 1
+            continue
+        # Primary antigen: most contacting residues, then most paratope
+        # contacts (deterministic tie-break by chain id).
+        cid, ag_seq, ab_idx, ag_idx = sorted(
+            eligible, key=lambda x: (-len(x[3]), -len(x[2]), x[0]))[0]
+        if len(ab_idx) < MIN_CONTACTS or len(ag_idx) < MIN_CONTACTS:
+            join_skip['too_few_contacts'] = join_skip.get('too_few_contacts', 0) + 1
+            continue
+
         regions = anchor_split(vh_seq)
         if regions is None:
-            skipped['anchor_split'] = skipped.get('anchor_split', 0) + 1
+            join_skip['anchor_split'] = join_skip.get('anchor_split', 0) + 1
             continue
-        ab_label = np.zeros(len(vh_seq), dtype=np.float32)
-        ab_label[list(ab_idx)] = 1.0
-        ag_label = np.zeros(len(ag_seq), dtype=np.float32)
-        ag_label[list(ag_idx)] = 1.0
-        np.savez_compressed(npz_path, ab_label=ab_label, ag_label=ag_label)
+        # anchor_split tolerates resolved cloning tails AFTER FR4; the
+        # concatenated regions are the clean VHH. FR1 always starts at
+        # position 0, so indices need only a right-side filter (no shift).
+        vh_clean = ''.join(regions[k] for k in REGION_COLS)
+        ab_idx = {i for i in ab_idx if i < len(vh_clean)}
+        if len(ab_idx) < MIN_CONTACTS:
+            join_skip['too_few_contacts'] = join_skip.get('too_few_contacts', 0) + 1
+            continue
         ag_name = 'AG' + hashlib.md5(ag_seq.encode()).hexdigest()[:10]
-        rows.append({**regions, 'vh': vh_seq, 'Antigen': ag_name, 'Antigen Sequence': ag_seq,
-                     'sample_id': sample_id, 'pdb': pdb})
+        rows.append({
+            **regions,
+            'vh': vh_clean,
+            'Antigen': ag_name,
+            'Antigen Sequence': ag_seq,
+            '_sid': f'{pdb}_{ab_chain}',
+            '_inst': inst,
+            'pdb': pdb,
+            '_official': info['split'],
+            '_ab_idx': ab_idx,
+            '_ag_idx': ag_idx,
+        })
 
     if not rows:
-        raise RuntimeError('No usable complexes produced. Check the skip log above.')
+        raise RuntimeError('No usable VHH-antigen complexes after join. '
+                           f'Skip counts: {join_skip}')
+    print(f'[join] kept {len(rows)}; skips: {join_skip}')
+    if n_test:
+        print(f'[join] {n_test} official-test complexes excluded '
+              f'(--include_official_test to keep them).')
 
-    # Split by unique ANTIGEN so all complexes against one antigen stay on the
-    # same side (prevents antigen-level leakage between train and val).
-    out = pd.DataFrame(rows)
-    antigens = out['Antigen Sequence'].unique().tolist()
+    # ---- sample ids, safe even on case-insensitive filesystems ------------
+    # PDB chain letters are case-sensitive: 7nvm_n and 7nvm_N are different
+    # chains, but on Windows/macOS 7nvm_n.npz == 7nvm_N.npz. Colliding groups
+    # get a short hash of the full INSTANCE stem as suffix.
+    sid_groups = {}
+    for r in rows:
+        sid_groups.setdefault(r['_sid'].lower(), []).append(r)
+    n_coll = 0
+    for grp in sid_groups.values():
+        if len(grp) == 1:
+            grp[0]['sample_id'] = grp[0]['_sid']
+        else:
+            n_coll += len(grp)
+            for r in grp:
+                # Encode chain-letter case with digits (0 lower / 1 upper) so
+                # ids stay distinct on case-insensitive filesystems.
+                chain = r['_sid'].rsplit('_', 1)[1]
+                enc = ''.join(f'{c}0' if c.islower() else f'{c.lower()}1'
+                              for c in chain)
+                suffix = hashlib.md5(r['_inst'].encode()).hexdigest()[:4]
+                r['sample_id'] = f"{r['pdb']}_{enc}_{suffix}"
+    if n_coll:
+        print(f'[join] {n_coll} rows given case-collision-safe sample ids.')
+
+    # ---- val carved from OFFICIAL train by unique antigen -----------------
+    # Official-test rows (only present with --include_official_test) always
+    # stay 'train'; they never define or join the validation set.
+    antigens = sorted({r['Antigen Sequence'] for r in rows
+                       if r['_official'] == 'train'})
     rng = random.Random(args.seed)
     rng.shuffle(antigens)
     n_val = max(1, int(round(len(antigens) * args.val_ratio)))
     val_ags = set(antigens[:n_val])
-    out['split'] = ['val' if ag in val_ags else 'train' for ag in out['Antigen Sequence']]
-    out = out[['H-FR1', 'H-CDR1', 'H-FR2', 'H-CDR2', 'H-FR3', 'H-CDR3', 'H-FR4',
-               'vh', 'Antigen', 'Antigen Sequence', 'sample_id', 'pdb', 'split']]
+    for r in rows:
+        if r['_official'] == 'train' and r['Antigen Sequence'] in val_ags:
+            r['split'] = 'val'
+        else:
+            r['split'] = 'train'
+
+    if args.max_structures and len(rows) > args.max_structures:
+        rng2 = random.Random(args.seed)
+        rows = rng2.sample(rows, args.max_structures)
+
+    # ---- write labels + CSV ------------------------------------------------
+    out_rows = []
+    for r in rows:
+        npz_path = os.path.join(res_dir, f"{r['sample_id']}.npz")
+        ab_label = np.zeros(len(r['vh']), dtype=np.float32)
+        ab_label[sorted(r['_ab_idx'])] = 1.0
+        ag_label = np.zeros(len(r['Antigen Sequence']), dtype=np.float32)
+        ag_label[sorted(r['_ag_idx'])] = 1.0
+        np.savez_compressed(npz_path, ab_label=ab_label, ag_label=ag_label)
+        out_rows.append({k: r[k] for k in
+                         REGION_COLS + ['vh', 'Antigen', 'Antigen Sequence',
+                                        'sample_id', 'pdb', 'split']})
+
+    out = pd.DataFrame(out_rows)
     csv_path = os.path.join(args.out_dir, 'sabdab_nano.csv')
     out.to_csv(csv_path, index=False)
 
     n_val_rows = int((out['split'] == 'val').sum())
-    print(f'\nDone: {len(out)} complexes '
-          f'(train {len(out) - n_val_rows} / val {n_val_rows}, '
-          f'{len(antigens) - n_val} train antigens / {n_val} val antigens)')
-    print(f'Skipped: {skipped}')
-    print(f'CSV -> {csv_path}')
+    print(f'\nDone: {len(out)} complexes (train {len(out)-n_val_rows} / val {n_val_rows}, '
+          f'{len(antigens)-n_val} train antigens / {n_val} val antigens)')
+    print(f'CSV    -> {csv_path}')
     print(f'Labels -> {res_dir}/')
     print('\nNext (stage-1):')
     print(f'  python main.py train --task struct --model_name sabdabstruct '

@@ -81,25 +81,93 @@ _C2_PAT = re.compile(r'[DE][TD][ATGSN][VILAM]Y[YFHSTLRI]?C')  # ...EDTAVYYC
 _FR3_CORE = re.compile(r'[YF][A-Z][DSNEGPA]')       # NYAD / YAG / YPD ...
 
 # Chothia_H canonical lengths with empirically validated VHH tolerance.
+# CDR1/FR3 upper bounds are widened beyond the canonical range for the rare
+# long-CDR1 / long-FR3 VHH germlines seen in structural databases (SAbDab2);
+# the conserved Trp35 / Cys94 hallmarks still pin the other boundaries.
 _BOUNDS = {
-    'H-FR1': (18, 30), 'H-CDR1': (4, 14), 'H-FR2': (15, 22),
-    'H-CDR2': (3, 12), 'H-FR3': (30, 47), 'H-CDR3': (4, 30),
-    'H-FR4': (9, 14),
+    'H-FR1': (18, 30), 'H-CDR1': (4, 20), 'H-FR2': (15, 22),
+    'H-CDR2': (3, 12), 'H-FR3': (30, 56), 'H-CDR3': (4, 30),
+    'H-FR4': (7, 14),
 }
 
+# Observed natural variation across SAbDab2 structures and NGS (AVIDa) VHHs:
+# Trp103 substitutions/deletions, 105 Q->K/R/P/H/A/G/S/L/E/T/V/I/M, 106
+# G->P/F/R/T, 107 T->A/I/L/E, 108 Q->L/P/K/R/T/E (T is the canonical JH4
+# allele), 110 T->M, and records truncated after 108-111. Positions 107-110
+# are therefore the end-anchoring core (107-110); 103-106 are taken as-is.
+# The strict 105-110 core is kept for internal (tail) matches to avoid
+# core-like motifs inside long CDR3 loops.
+_FR4_CORE_LOOSE = re.compile(
+    r'[TASGVILME][QLMIVPKRTE][VILA][TASGVM]')
+_FR4_CORE = re.compile(r'[QKNR]G[TSAGV][QLMIVPKRT][VILA][TSAGV]')
+_FR4_CORE_PART = re.compile(
+    r'[TASGVILME][QLMIVPKRTE][VILA]?[TASGVM]?$')
 
-def _find_fr4_start(seq):
-    """FR4 (Chothia 103-113) always ends in TVSS; scan its plausible lengths.
 
-    Conserved first residue is Trp103 (frequently W, occasionally R/G/Q in
-    framework mutants)."""
-    for length in (11, 10, 12, 13, 9, 14):
-        start = len(seq) - length
+def _find_fr4(seq):
+    """Locate FR4 (Chothia 103-113) and return ``(start, end)``.
+
+    Position 103 is W in the textbook VHH but substitutions/deletions occur,
+    and records frequently truncate after FR4 or continue into a cloning
+    tail. The search has two tiers (see tier comments below): a strict
+    hallmark core that tolerates tails, and an end-anchored loose core for
+    the hyper-variable 103-110 region. Tier 1 wins whenever it fires."""
+    n = len(seq)
+    win_lo = max(70, n - 50)
+    win = seq[win_lo:]
+
+    def make_loose(m, partial=False):
+        core_abs = win_lo + m.start()
+        start = core_abs - 4  # positions 103-106 are variable
         if start < 70:
+            return None
+        end = n if partial else min(n, start + 11)
+        if 7 <= end - start <= 14:
+            return start, end
+        return None
+
+    # 1) STRICT 105-110 core with a genuine W/R/F103 hallmark, tail 0-40.
+    # This is the only tier allowed away from the sequence end, because the
+    # hallmark discriminates FR4 from core-like motifs inside long CDR3
+    # loops (e.g. RGSRLS, or TEAS preceded by a CDR3 phenylalanine).
+    best = None
+    for m in _FR4_CORE.finditer(win):
+        core_abs = win_lo + m.start()
+        start = core_abs - 2
+        end = min(n, start + 11)
+        tail = n - end
+        if not (0 <= tail <= 40) or start < 70 or seq[start] not in 'WRF':
             continue
-        if seq[start] in 'WRFGRQN' and seq[start:start + length].endswith('TVSS'):
-            return start
-    return None
+        if not (7 <= end - start <= 14):
+            continue
+        key = (0 if seq[start] == 'W' else 1, -start)
+        if best is None or key < best[0]:
+            best = (key, (start, end))
+    if best is not None:
+        return best[1]
+
+    # 2) LOOSE 107-110 core strictly end-anchored (tip <= 4 residues) for the
+    # hyper-variable 103-106 region; then a partial core for records
+    # truncated at 108-111.
+    best = None  # key: (partial 0<1, non-Trp 0<1, -start)
+    for m in _FR4_CORE_LOOSE.finditer(win):
+        trail = len(win) - m.end()
+        if not (0 <= trail <= 4):
+            continue
+        cand = make_loose(m)
+        if cand is None:
+            continue
+        hallmark = seq[cand[0]] in 'WRF'
+        key = (0, 0 if hallmark else 1, -cand[0])
+        if best is None or key < best[0]:
+            best = (key, cand)
+    if best is None:
+        m = _FR4_CORE_PART.search(win)
+        if m is not None and len(win) - m.end() == 0:
+            cand = make_loose(m, partial=True)
+            if cand is not None:
+                best = ((1, 0 if seq[cand[0]] == 'W' else 1, -cand[0]), cand)
+    return None if best is None else best[1]
 
 
 def anchor_split(seq):
@@ -131,24 +199,34 @@ def anchor_split(seq):
     if w is None:
         return None
     fr2_start = w - 2  # positions 33-34 precede Trp35
-    if not (4 <= fr2_start - cdr1_start <= 14):
+    if not (_BOUNDS['H-CDR1'][0] <= fr2_start - cdr1_start <= _BOUNDS['H-CDR1'][1]):
         return None
 
-    # --- FR4 / conserved Trp103 ---
-    f4 = _find_fr4_start(seq)
-    if f4 is None:
+    # --- FR4 / conserved Trp103 (may be followed by a cloning tail) --------
+    fr4 = _find_fr4(seq)
+    if fr4 is None:
         return None
+    f4, f4_end = fr4
 
-    # --- conserved Cys94 at the end of FR3 ---
+    # --- conserved Cys94 at the end of FR3 --------------------------------
+    # The FR3 hallmark pattern selects the junction specifically: extra
+    # non-canonical disulfide cysteines inside long CDR3 loops never match
+    # it, so the LAST pattern match is the junction. The plain-rfind fallback
+    # is range-guarded so it can never grab Cys22 or an intra-CDR3 Cys.
     c2 = -1
-    for m in _C2_PAT.finditer(seq, f4 - 42, f4 - 2):
+    for m in _C2_PAT.finditer(seq, f4 - 48, f4 - 2):
         c2 = m.end() - 1
+    if c2 < 0 or not (4 <= f4 - c2 <= 36):
+        c2 = -1
+        for m in re.finditer(r'Y[YFHSTLRI]?C', seq[f4 - 48:f4 - 2]):
+            c2 = f4 - 48 + m.end() - 1
+    if c2 < 0 or not (4 <= f4 - c2 <= 36):
+        c = seq.rfind('C', f4 - 38, f4 - 2)
+        if c >= 0 and 4 <= f4 - c <= 36:
+            c2 = c
+        else:
+            c2 = -1
     if c2 < 0:
-        for m in re.finditer(r'Y[YF]C', seq[f4 - 42:f4 - 2]):
-            c2 = f4 - 42 + m.end() - 1
-    if c2 < 0:
-        c2 = seq.rfind('C', f4 - 34, f4 - 2)
-    if c2 < 0 or not (4 <= f4 - c2 <= 32):
         return None
 
     # --- FR3 start: default after 19-residue FR2 + 5-residue CDR2, snapped to
@@ -161,7 +239,7 @@ def anchor_split(seq):
             fr3 = candidate
     fr2_end = fr2_start + 19
 
-    cuts = [0, cdr1_start, fr2_start, fr2_end, fr3, c2 + 1, f4, len(seq)]
+    cuts = [0, cdr1_start, fr2_start, fr2_end, fr3, c2 + 1, f4, f4_end]
     if any(cuts[i] >= cuts[i + 1] for i in range(len(cuts) - 1)):
         return None
     regions = [seq[cuts[i]:cuts[i + 1]] for i in range(7)]
