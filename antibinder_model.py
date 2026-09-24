@@ -260,7 +260,10 @@ class GatedAttentionMIL(nn.Module):
     def forward(self, x, mask):
         # x: (B, L, latent), mask: (B, L) bool, True = real residue
         attn = self.w(torch.tanh(self.V(x)) * torch.sigmoid(self.U(x))).squeeze(-1)  # (B, L)
-        attn = attn.masked_fill(~mask, -1e9)  # -1e9 -> -inf under fp16, softmax-safe
+        # fp16-safe mask value: -1e4 is large enough to zero under softmax yet
+        # stays within Half range (max ~65504); -1e9 / finfo.min would overflow.
+        mask_val = torch.tensor(-1e4, dtype=attn.dtype, device=attn.device)
+        attn = attn.masked_fill(~mask, mask_val)
         attn = torch.softmax(attn, dim=1)     # (B, L) attention weights
         bag = (attn.unsqueeze(-1) * x).sum(dim=1)  # (B, latent)
         return bag, attn
