@@ -4,6 +4,7 @@ import lmdb
 import pickle
 import contextlib
 import io
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
